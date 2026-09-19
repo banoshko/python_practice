@@ -13,7 +13,7 @@ while True:
         if user == 1:
             try:
                 name = input("--------------------\nEnter name: ")
-                number = int(input("Enter number: "))
+                number = (input("Enter number: "))
                 print("--------------------")
                 contacts[name] = number
                 with open("saves/phonebook_memory.json", "w") as f:
