@@ -6,7 +6,7 @@ while True:
         else:
             start = [0,1]
 
-            for i in range(number):
+            for _ in range(number):
                 steps = start[0] + start[1]
                 start.append(steps)
                 start.pop(0)

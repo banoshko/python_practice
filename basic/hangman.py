@@ -27,7 +27,7 @@ def save():
         print("File not found.")
 
 while wrong_guesses != tries and ("".join(hidden)) != word:
-    guess = input("Take a guess: ")
+    guess = input("Take a guess: ").strip().capitalize()
 
     if int(len(guess)) > 1:
         print("You can only guess by the letter!")

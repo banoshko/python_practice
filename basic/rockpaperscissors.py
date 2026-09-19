@@ -32,12 +32,18 @@ def get_result(player, bot):
 shortcuts = {
     "1": "rock", "2": "paper", "3": "scissors"
 }
+print("You can always quick by pressing 'Q'")
 while True:
     bot_input = random.choice(["rock", "paper", "scissors"])
     player_input = input("Choose between ROCK (1), PAPER (2) and SCISSORS (3): ")
-    result = (get_result(player_input, bot_input))
-
-    if result == None:
-        print("Something went wrong.")
+    if player_input.lower() == "q":
+        print(f"Final score: {score}")
+        break
     else:
-        print(f"{result} Your score is: {score}")
+        result = (get_result(player_input, bot_input))
+
+
+        if result == None:
+            print("Something went wrong.")
+        else:
+            print(f"{result} Your score is: {score}")
