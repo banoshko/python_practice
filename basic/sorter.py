@@ -1,26 +1,31 @@
 from pathlib import Path
 folder = Path("files")
-items_count = 0
 dict = {
     ".txt": "text files", ".json": "text files",
     ".png": "pictures", ".jpg": "pictures", ".jpeg": "pictures",
     ".zip": "compressed files"
 }
-def item_sorter(folder, suffix, item):
+position = 1
+def item_sorter(folder, suffix, item, position):
     destination = folder/suffix
     destination.mkdir(exist_ok=True)
-    item_destination = destination/item.name
+    absolute_destination = destination/item.suffix.lower().lstrip(".")
+    absolute_destination.mkdir(exist_ok=True)
+    item_destination = absolute_destination/item.name
+    if item.exists():
+        while item_destination.exists():
+            str(position)
+            q = Path(f"{item.stem}_{position}{item.suffix}")
+            int(position)
+            position += 1
+            print(item)
+            item_destination =  absolute_destination/q.name 
     item.rename(item_destination)
     
 for item in folder.iterdir():
     if item.is_file():
         suffix = dict.get(item.suffix.lower(), "other")
-        item_sorter(folder, suffix, item)
+        item_sorter(folder, suffix, item, position)
 
-counter = {}
 for items in folder.iterdir():
-    for _ in items.iterdir():
-        items_count +=1
-    counter[items.name] = items_count
-    print(f"You have {counter[items.name]} files in your {items.name} folder")
-    items_count = 0
+    print(f"You have {len(list(items.rglob('*.*')))} files in your {items.name} folder" if items.is_dir() else (""))
