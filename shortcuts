@@ -1,8 +1,0 @@
-files = [
-    "a.txt", "B.txt", "C.TXT", "d.PNG", "E.jPeG", "f.Zip", "g.json", "H.jpG"
-]
-dict = {
-    ".txt": "text files", ".json": "text files",
-    ".png": "pictures", ".jpg": "pictures", ".jpeg": "pictures",
-    ".zip": "compressed files"
-}

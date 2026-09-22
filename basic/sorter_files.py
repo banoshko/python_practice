@@ -6,5 +6,10 @@ files = [
 folder = Path("files")
 folder.mkdir(exist_ok=True)
 for file in files:
+    position = 1
     file_creator = folder/file
+    while file_creator.exists():
+        q = Path(f"{Path(file).stem}_{position}{Path(file).suffix}")
+        position += 1
+        file_creator =  folder/q.name 
     file_creator.touch()
