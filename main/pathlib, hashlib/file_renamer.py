@@ -4,13 +4,13 @@ folder = Path("files")
 cycle = 0
 renamed = {}
 for file_original in folder.iterdir():
-    cycle += 1
     new_file = folder / f"{cycle}_{file_original.name}"
     if file_original.is_file():
+        cycle += 1
         if dry_run == True:
             print(f"I'd rename item {file_original} to {new_file}")
         else:
-            renamed[new_file] = f"{file_original}"
+            renamed[new_file] = file_original
             file_original.rename(new_file)
 
 def restore():

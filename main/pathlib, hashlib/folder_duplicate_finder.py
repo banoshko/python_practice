@@ -2,8 +2,8 @@ import hashlib
 from pathlib import Path
 
 dry_run = False #Use for checking where items end up.
-
 target_folder = Path(r"C:\Users\richi\Downloads")
+
 bin = Path(fr"{target_folder}\duplicates")
 bin.mkdir(exist_ok=True)
 seen = []
