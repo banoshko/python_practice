@@ -1,9 +1,9 @@
 import hashlib
 from pathlib import Path
 
-dry_run = 0 #Use for checking where items end up.
+dry_run = False #Use for checking where items end up.
 
-target_folder = Path(r"C:\Users\richi\Downloads") 
+target_folder = Path(r"C:\Users\richi\Downloads")
 bin = Path(fr"{target_folder}\duplicates")
 bin.mkdir(exist_ok=True)
 seen = []
@@ -43,12 +43,6 @@ def rename():
                 if hash_bin == hash_target and any(suf in target_file.stem for suf in suffix):
                     final_target_name = f"{target_folder}/{target_file.stem.rsplit(' (', 1)[0]}{target_file.suffix}"
                     target_file.rename(final_target_name)
-
-
-
-
-#f"{target_folder}/{suffix}".rename("{target_folder}/{name}")
-    
 
 if dry_run == False:
     while True:
