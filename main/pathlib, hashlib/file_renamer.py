@@ -1,11 +1,11 @@
 from pathlib import Path
 dry_run = False #Use for checking where items end up.
 folder = Path("files")
-cycle = 0
+cycle = 1
 renamed = {}
 for file_original in folder.iterdir():
-    new_file = folder / f"{cycle}_{file_original.name}"
     if file_original.is_file():
+        new_file = folder / f"{cycle}_{file_original.name}"
         cycle += 1
         if dry_run == True:
             print(f"I'd rename item {file_original} to {new_file}")
