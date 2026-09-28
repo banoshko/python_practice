@@ -12,4 +12,4 @@ for file in folder.iterdir():
             random_string = random_string + random_choice
             with open(file, "a") as f:
                 file.write_text(random_string)
-            print(f"File {file} filled!")
+        print(f"File {file} filled!")
