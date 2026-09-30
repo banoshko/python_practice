@@ -107,12 +107,12 @@ def duplicate_finder():
 
 def restore_duplicate():
     try:
-        if not duplicates.exists():
-            print("Nothing to restore")
-        elif target_folder.name == "duplicates":
+        if target_folder.name == "duplicates":
             for item in target_folder.iterdir():
                 item.rename(target_folder.parent/item.name)
             target_folder.rmdir()
+        elif not duplicates.exists():
+            print("Nothing to restore")
         else:
             for file in duplicates.iterdir():
                 if file.is_file():
@@ -177,3 +177,5 @@ restore_duplicate_button = tk.Button(canvas, text = "Undo duplicate search", com
 restore_duplicate_button.pack()
 
 canvas.mainloop()
+
+#TODO: Learn TK finally, make it so that when the user picks "duplicates" or "sorted" folder, it works too.
