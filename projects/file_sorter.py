@@ -41,6 +41,8 @@ def sort():
         print("Files sorted.")
     except NameError:
         print("You must pick a folder.")
+    except FileNotFoundError:
+        print("File not found.")
 
 def restore_sort():
     try:
@@ -66,6 +68,8 @@ def restore_sort():
             print("Files restored")
     except NameError:
         print("You must pick a folder.")
+    except FileNotFoundError:
+        print("File not found.")
 
 def duplicate_finder():
     try:
@@ -103,7 +107,8 @@ def duplicate_finder():
         print("Found all the duplicates")
     except NameError:
         print("You must pick a folder.")
-
+    except FileNotFoundError:
+        print("File not found.")
 
 def restore_duplicate():
     try:
@@ -120,6 +125,8 @@ def restore_duplicate():
             duplicates.rmdir()
     except NameError:
         print("You must pick a folder.")
+    except FileNotFoundError:
+        print("File not found.")
     print("Restored.")
 
 def pick_folder():
@@ -178,4 +185,4 @@ restore_duplicate_button.pack()
 
 canvas.mainloop()
 
-#TODO: Learn TK finally, make it so that when the user picks "duplicates" or "sorted" folder, it works too.
+#TODO: Learn TK finally, make the ugly files go in the bin :>
