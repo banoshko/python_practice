@@ -13,7 +13,9 @@ month_dict = {
     1: "(1) January", 2: "(2) February", 3: "(3) March", 4: "(4) April", 5: "(5) May", 6: "(6) June", 7: "(7) July", 8: "(8) August", 9: "(9) September", 10: "(10) October", 11: "(11) November", 12: "(12) December"
 }
 years_used = []
-
+suffix = [
+    "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)"
+]
 #Script itself
 def sort():
     try:
@@ -73,7 +75,7 @@ def restore_sort():
 
 def duplicate_finder():
     try:
-        seen = []
+        seen = {}
         size = 0
         for item in target_folder.iterdir():
             if item.is_file():
@@ -82,17 +84,18 @@ def duplicate_finder():
                     size = size + item.stat().st_size / (1024*1024*1024)
                 except FileNotFoundError:
                     print(f"File {item.name} not found")
-                if hash in seen:
 
-                    if dry_run == True:
-                        print("Duplicate")
-                        print(f"DUPLICATE: {item.name.upper()} matches a file previously seen!")  
-                        print("Duplicate")  
-                    elif dry_run == False:
+                if hash in seen:
+                    if any(suf in seen[hash].stem for suf in suffix):
                         duplicates.mkdir(exist_ok=True)
-                        item.rename(duplicates/item.name)
+                        if any(suf in item.stem for suf in suffix):
+                            item.rename(duplicates/item.name)
+                        else:
+                            seen[hash].rename(duplicates/seen[hash].name)
+                            seen[hash] = Path(item)
                 else:
-                    seen.append(hash)
+                    seen[hash] = Path(item)
+
                 try:
                     print(f"We're {(size) / folder_size * 100 :.2f}% through!")
                 except ZeroDivisionError:
@@ -102,9 +105,12 @@ def duplicate_finder():
                     size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
                 except FileNotFoundError:
                     print(f"File {item.name} not found")
+        
         if not duplicates.exists():
             print("YAY! No duplicates found!")
-        print("Found all the duplicates")
+        else:
+            print("Found all the duplicates")
+        
     except NameError:
         print("You must pick a folder.")
     except FileNotFoundError:
@@ -186,3 +192,25 @@ restore_duplicate_button.pack()
 canvas.mainloop()
 
 #TODO: Learn TK finally, make the ugly files go in the bin :>
+
+
+"""
+
+                if hash in seen:
+                    if dry_run == True:
+                        print("Duplicate")
+                        print(f"DUPLICATE: {item.name.upper()} matches a file previously seen!")  
+                        print("Duplicate")  
+                    elif dry_run == False:
+                        if not any(suf in item.stem for suf in suffix):
+                            for i in duplicates.iterdir():
+                                if get_hash(i) == hash and any(suf in i.stem for suf in suffix):
+                                    copy_path = Path(i)
+                                    i.rename(Path(item))
+                                    item.rename(copy_path)
+                        else:
+                            duplicates.mkdir()
+                            item.rename(duplicates/item.name)
+                else:
+                    seen.append(hash)
+"""
