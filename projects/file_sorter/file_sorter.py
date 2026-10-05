@@ -270,6 +270,36 @@ def get_hash(filepath = Path):
             hasher.update(chunk)
     return hasher.hexdigest()
 
+def tutorial():
+    tutorial = ctk.CTkToplevel()
+    tutorial.geometry("357x448")
+    tutorial.title("Tutorial")
+    tutorial.resizable(False, False)
+    tutorial.lift()
+    tutorial_label = ctk.CTkLabel(tutorial, text="Welcome to file sorter!", font=("times new roman", 32))
+    tutorial_label.pack(pady=(10,15))
+
+    tutorial_text1 = ctk.CTkLabel(tutorial, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!", font=("", 20))
+    tutorial_text1.pack()
+    tutorial_text2 = ctk.CTkLabel(tutorial, text="Functions", font=("", 20))
+    tutorial_text2.pack(pady=(25,0))
+    tutorial_text3 = ctk.CTkLabel(tutorial, text="a) File sorting", font=("", 16))
+    tutorial_text3.pack()
+    tutorial_text4 = ctk.CTkLabel(tutorial, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file", font=("", 13))
+    tutorial_text4.pack(pady=(0,10))
+    tutorial_text5 = ctk.CTkLabel(tutorial, text="b) Finding duplicates", font=("", 16))
+    tutorial_text5.pack()
+    tutorial_text6 = ctk.CTkLabel(tutorial, text="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files", font=("", 13))
+    tutorial_text6.pack(pady=(0,10))
+    tutorial_text7 = ctk.CTkLabel(tutorial, text="All changes all revertable and the duplicates aren't deleted.", font=("Roboto Bold", 12))
+    tutorial_text7.pack(pady=(15,5))
+
+    tutorial_close = ctk.CTkButton(tutorial, text="Got it", command=tutorial.destroy)
+    tutorial_close.pack()
+    tutorial.lift()
+
+
+
 #tk
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -323,41 +353,8 @@ except FileNotFoundError:
     print("File not found.")
 
 if tutorial_seen == 0:
-    text1 = \
-    "1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!"
-    text2 = "Functions:"
-    text3= "a) File Sorting"
-    text4= "Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file"
-    text5="b) Finding duplicates"
-    text6="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files"
-    text7="All changes all revertable and the duplicates aren't deleted."
-    tutorial = ctk.CTkToplevel()
-    tutorial.geometry("357x448")
-    tutorial.title("Tutorial")
-    tutorial.resizable(False, False)
-    tutorial.lift()
-    tutorial_label = ctk.CTkLabel(tutorial, text="Welcome to file sorter!", font=("times new roman", 32))
-    tutorial_label.pack(pady=(10,15))
-
-    tutorial_text1 = ctk.CTkLabel(tutorial, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!", font=("", 20))
-    tutorial_text1.pack()
-    tutorial_text2 = ctk.CTkLabel(tutorial, text="Functions", font=("", 20))
-    tutorial_text2.pack(pady=(25,0))
-    tutorial_text3 = ctk.CTkLabel(tutorial, text="a) File sorting", font=("", 16))
-    tutorial_text3.pack()
-    tutorial_text4 = ctk.CTkLabel(tutorial, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file", font=("", 13))
-    tutorial_text4.pack(pady=(0,10))
-    tutorial_text5 = ctk.CTkLabel(tutorial, text="b) Finding duplicates", font=("", 16))
-    tutorial_text5.pack()
-    tutorial_text6 = ctk.CTkLabel(tutorial, text="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files", font=("", 13))
-    tutorial_text6.pack(pady=(0,10))
-    tutorial_text7 = ctk.CTkLabel(tutorial, text="All changes all revertable and the duplicates aren't deleted.", font=("Roboto Bold", 12))
-    tutorial_text7.pack(pady=(15,5))
-
-    tutorial_close = ctk.CTkButton(tutorial, text="Got it", command=tutorial.destroy)
-    tutorial_close.pack()
-    tutorial.lift()
-    tutorial_seen = 0 # set to 1
+    tutorial()
+    tutorial_seen = 1 #set to 1
     try:
         with open("projects/file_sorter/memory.json", "w") as f:
             json.dump(tutorial_seen, f)
