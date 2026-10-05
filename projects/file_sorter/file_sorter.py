@@ -8,6 +8,8 @@ import hashlib
 import customtkinter as ctk
 from tkinter import filedialog
 import random
+import json
+
 #Developer settings
 month_dict = {
     1: "(1) January", 2: "(2) February", 3: "(3) March", 4: "(4) April", 5: "(5) May", 6: "(6) June", 7: "(7) July", 8: "(8) August", 9: "(9) September", 10: "(10) October", 11: "(11) November", 12: "(12) December"
@@ -122,6 +124,8 @@ def restore_sort():
         status.after(1700)
     except FileNotFoundError:
         print("File not found.")
+    except PermissionError:
+        print("Not allowed to move this file.")
     status.configure(text=basic)
     canvas.update_idletasks()
 
@@ -293,14 +297,14 @@ actions_area = ctk.CTkFrame(canvas)
 actions_area.pack(fill="x")
 
 button_s = ctk.CTkButton(actions_area, text="Sort files", command=sort)
-button_s.grid(row=0, column=1, padx=(50, 8), pady=8, sticky="w")
+button_s.grid(row=0, column=1, padx=(50, 8), pady=(12,8), sticky="w")
 button_rs = ctk.CTkButton(actions_area, text="Restore sorted", command=restore_sort, font=("", 10), width=100)
-button_rs.grid(row=1, column=1, padx=(70, 8), pady=8, sticky="w")
+button_rs.grid(row=1, column=1, padx=(70, 8), pady=(8,12), sticky="w")
 
 button_d = ctk.CTkButton(actions_area, text="Find duplicates", command=duplicate_finder)
-button_d.grid(row=0, column=2, padx=(28,50), pady=8, sticky="e")
+button_d.grid(row=0, column=2, padx=(28,50), pady=(12,8), sticky="e")
 button_rd = ctk.CTkButton(actions_area, text="Restore duplicates", command=restore_duplicate, font=("", 10), width=100)
-button_rd.grid(row=1, column=2, padx=(28,70), pady=8, sticky="e")
+button_rd.grid(row=1, column=2, padx=(28,70), pady=(8,12), sticky="e")
 
 #footer
 footer_area = ctk.CTkFrame(canvas)
@@ -310,5 +314,54 @@ log_title.pack(pady=(55,0))
 status = ctk.CTkLabel(footer_area, text=basic, font=("",16), text_color="grey")
 status.pack(pady=(5,20))
 
+
+#tutorial
+try:
+    with open("projects/file_sorter/memory.json", "r") as f:
+        tutorial_seen = json.load(f)
+except FileNotFoundError:
+    print("File not found.")
+
+if tutorial_seen == 0:
+    text1 = \
+    "1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!"
+    text2 = "Functions:"
+    text3= "a) File Sorting"
+    text4= "Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file"
+    text5="b) Finding duplicates"
+    text6="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files"
+    text7="All changes all revertable and the duplicates aren't deleted."
+    tutorial = ctk.CTkToplevel()
+    tutorial.geometry("357x448")
+    tutorial.title("Tutorial")
+    tutorial.resizable(False, False)
+    tutorial.lift()
+    tutorial_label = ctk.CTkLabel(tutorial, text="Welcome to file sorter!", font=("times new roman", 32))
+    tutorial_label.pack(pady=(10,15))
+
+    tutorial_text1 = ctk.CTkLabel(tutorial, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!", font=("", 20))
+    tutorial_text1.pack()
+    tutorial_text2 = ctk.CTkLabel(tutorial, text="Functions", font=("", 20))
+    tutorial_text2.pack(pady=(25,0))
+    tutorial_text3 = ctk.CTkLabel(tutorial, text="a) File sorting", font=("", 16))
+    tutorial_text3.pack()
+    tutorial_text4 = ctk.CTkLabel(tutorial, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file", font=("", 13))
+    tutorial_text4.pack(pady=(0,10))
+    tutorial_text5 = ctk.CTkLabel(tutorial, text="b) Finding duplicates", font=("", 16))
+    tutorial_text5.pack()
+    tutorial_text6 = ctk.CTkLabel(tutorial, text="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files", font=("", 13))
+    tutorial_text6.pack(pady=(0,10))
+    tutorial_text7 = ctk.CTkLabel(tutorial, text="All changes all revertable and the duplicates aren't deleted.", font=("Roboto Bold", 12))
+    tutorial_text7.pack(pady=(15,5))
+
+    tutorial_close = ctk.CTkButton(tutorial, text="Got it", command=tutorial.destroy)
+    tutorial_close.pack()
+    tutorial.lift()
+    tutorial_seen = 0 # set to 1
+    try:
+        with open("projects/file_sorter/memory.json", "w") as f:
+            json.dump(tutorial_seen, f)
+    except FileNotFoundError:
+        print("File not found.")
 canvas.mainloop()
 #TODO: Learn TK finally
