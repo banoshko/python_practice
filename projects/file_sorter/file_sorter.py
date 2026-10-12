@@ -20,7 +20,8 @@ suffix = [
 ]
 lines = ["What a mess!", "Working on it!"]
 basic = "Sitting..." #what the idle status says
-
+tutorial = None
+menu = None
 #Script itself
 def sort():
     line = random.choice(lines)
@@ -270,36 +271,59 @@ def get_hash(filepath = Path):
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def tutorial():
-    tutorial = ctk.CTkToplevel()
-    tutorial.geometry("357x448")
-    tutorial.title("Tutorial")
-    tutorial.resizable(False, False)
-    tutorial.lift()
-    tutorial_label = ctk.CTkLabel(tutorial, text="Welcome to file sorter!", font=("times new roman", 32))
-    tutorial_label.pack(pady=(10,15))
+def tutorial_open():
+    global tutorial
+    if tutorial is None or not tutorial.winfo_exists():
+        tutorial = ctk.CTkToplevel()
+        tutorial.geometry("357x448")
+        tutorial.title("Tutorial")
+        tutorial.resizable(False, False)
+        tutorial.lift()
+        tutorial_label = ctk.CTkLabel(tutorial, text="Welcome to file sorter!", font=("times new roman", 32))
+        tutorial_label.pack(pady=(10,15))
+        tutorial_text1 = ctk.CTkLabel(tutorial, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!", font=("", 20))
+        tutorial_text1.pack()
+        tutorial_text2 = ctk.CTkLabel(tutorial, text="Functions", font=("", 20))
+        tutorial_text2.pack(pady=(25,0))
+        tutorial_text3 = ctk.CTkLabel(tutorial, text="a) File sorting", font=("", 16))
+        tutorial_text3.pack()
+        tutorial_text4 = ctk.CTkLabel(tutorial, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file", font=("", 13))
+        tutorial_text4.pack(pady=(0,10))
+        tutorial_text5 = ctk.CTkLabel(tutorial, text="b) Finding duplicates", font=("", 16))
+        tutorial_text5.pack()
+        tutorial_text6 = ctk.CTkLabel(tutorial, text="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files", font=("", 13))
+        tutorial_text6.pack(pady=(0,10))
+        tutorial_text7 = ctk.CTkLabel(tutorial, text="All changes all revertable and the duplicates aren't deleted.", font=("Roboto Bold", 12))
+        tutorial_text7.pack(pady=(15,5))
 
-    tutorial_text1 = ctk.CTkLabel(tutorial, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!", font=("", 20))
-    tutorial_text1.pack()
-    tutorial_text2 = ctk.CTkLabel(tutorial, text="Functions", font=("", 20))
-    tutorial_text2.pack(pady=(25,0))
-    tutorial_text3 = ctk.CTkLabel(tutorial, text="a) File sorting", font=("", 16))
-    tutorial_text3.pack()
-    tutorial_text4 = ctk.CTkLabel(tutorial, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file", font=("", 13))
-    tutorial_text4.pack(pady=(0,10))
-    tutorial_text5 = ctk.CTkLabel(tutorial, text="b) Finding duplicates", font=("", 16))
-    tutorial_text5.pack()
-    tutorial_text6 = ctk.CTkLabel(tutorial, text="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files", font=("", 13))
-    tutorial_text6.pack(pady=(0,10))
-    tutorial_text7 = ctk.CTkLabel(tutorial, text="All changes all revertable and the duplicates aren't deleted.", font=("Roboto Bold", 12))
-    tutorial_text7.pack(pady=(15,5))
+        tutorial_close = ctk.CTkButton(tutorial, text="Got it", command=tutorial.destroy)
+        tutorial_close.pack()
+        tutorial.lift()
+    else:
+        tutorial.lift()
 
-    tutorial_close = ctk.CTkButton(tutorial, text="Got it", command=tutorial.destroy)
-    tutorial_close.pack()
-    tutorial.lift()
+def console_open():
+    ()
 
+def stick_menu(event=None):
+    canvasx = canvas.winfo_x()
+    menux = canvasx + canvas.winfo_width() + 9
+    canvasy = canvas.winfo_y()
+    menuy = canvasy+52
+    menu.geometry(f"+{menux}+{menuy}")
 
-
+def toggle_menu():
+    global menu
+    if not menu.winfo_ismapped():
+        stick_menu()
+        menu.deiconify()
+        menu.lift()
+        canvas.lift()
+        tutorial_button.pack()
+        console_button.pack()
+    else:
+        menu.withdraw()
+        
 #tk
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -307,12 +331,24 @@ canvas = ctk.CTk()
 canvas.title("File sorter")
 canvas.geometry("408x512")
 canvas.resizable(width=False, height=False)
+menu = ctk.CTkToplevel()
+menu.geometry("256x114")
+menu.overrideredirect(True)
+menu.resizable(False, False)
+menu.withdraw()
+canvas.bind("<Configure>", stick_menu)
+tutorial_button = ctk.CTkButton(menu, command=tutorial_open, text="Tutorial")
+console_button = ctk.CTkButton(menu, text="Console", command=console_open)
+
 
 #header
 header_area = ctk.CTkFrame(canvas)
 header_area.pack(fill="x")
 title = ctk.CTkLabel(header_area, text="File Sorter", font=("times new roman", 36))
 title.pack(pady=24)
+
+options = ctk.CTkButton(header_area, text="?", command=toggle_menu, width=12, height=12)
+options.place(anchor="ne", relx=1, rely=0, x=-8, y=8)
 
 #folder
 folder_area = ctk.CTkFrame(canvas)
@@ -353,12 +389,15 @@ except FileNotFoundError:
     print("File not found.")
 
 if tutorial_seen == 0:
-    tutorial()
-    tutorial_seen = 1 #set to 1
+    tutorial_open()
+    tutorial_seen = 1
     try:
         with open("projects/file_sorter/memory.json", "w") as f:
             json.dump(tutorial_seen, f)
     except FileNotFoundError:
         print("File not found.")
+
 canvas.mainloop()
-#TODO: Learn TK finally
+
+
+#TODO: Learn TK finally, v menu, ked pouzivatel vyberie tlacidlo, nech sa menu schová a príde to, čo chceli
