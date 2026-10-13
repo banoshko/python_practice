@@ -18,23 +18,30 @@ years_used = []
 suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)"
 ]
-lines = ["What a mess!", "Working on it!"]
 basic = "Sitting..." #what the idle status says
-tutorial = None
-menu = None
+
+try:
+    with open("memory.json", "r") as f:
+        tutorial_seen = json.load(f)
+except FileNotFoundError:
+    print("File not found.")
+
+if tutorial_seen == 0:
+    currently_open = 1
+else:
+    currently_open = 0  
 #Script itself
 def sort():
-    line = random.choice(lines)
     try:
         bar = ctk.CTkProgressBar(right)
-        bar.grid(row=3, padx=20)
         bar.set(0)
         canvas.update_idletasks()
         bar_text = ctk.CTkLabel(right, text="")
         bar_text.grid(row=4)
         for item in target_folder.iterdir():
+            bar.grid(row=3, padx=20)
             try:
-                if item.is_file() or item.is_dir() and item.name != "sorted":
+                if item.is_file() or item.is_dir() and item.name not in ["duplicates", "sorted"]:
                     year = str(datetime.fromtimestamp(item.stat().st_mtime).year)
                     month = month_dict[datetime.fromtimestamp(item.stat().st_mtime).month]
                     sorted_dir.mkdir(exist_ok=True)
@@ -50,7 +57,7 @@ def sort():
                         if percent > 80:
                             status.configure(text="Almost there!")
                         else:
-                            status.configure(text=f"{line}")
+                            status.configure(text="Sorting...")
                         bar_text.configure(text = f"{percent :.2f}%")
                         bar.set(percent/100)
                         canvas.update_idletasks()
@@ -131,16 +138,15 @@ def restore_sort():
     canvas.update_idletasks()
 
 def duplicate_finder():
-    line = random.choice(lines)
     try:
         bar = ctk.CTkProgressBar(right)
-        bar.grid(row=3, padx=20)
         canvas.update_idletasks()
         bar_text = ctk.CTkLabel(right, text="")
         seen = {}
         size = 0
         bar.set(0)
         for item in target_folder.iterdir():
+            bar.grid(row=3, padx=20)
             bar_text.grid(row=4)
             if item.is_file():
                 hash = get_hash(item)
@@ -166,7 +172,7 @@ def duplicate_finder():
                     if percent > 80:
                         status.configure(text="Almost there!")
                     else:
-                        status.configure(text=f"{line}")
+                        status.configure(text="Finding all the duplicates")
                     bar_text.configure(text = f"{percent :.2f}%")
                     bar.set(percent/100)
                     canvas.update_idletasks()
@@ -271,37 +277,71 @@ def get_hash(filepath = Path):
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def tutorial_open():
-    global tutorial
-    if tutorial is None or not tutorial.winfo_exists():
-        tutorial = ctk.CTkToplevel()
-        tutorial.geometry("357x448")
-        tutorial.title("Tutorial")
-        tutorial.resizable(False, False)
-        tutorial.lift()
-        tutorial_label = ctk.CTkLabel(tutorial, text="Welcome to file sorter!", font=("times new roman", 32))
-        tutorial_label.pack(pady=(10,15))
-        tutorial_text1 = ctk.CTkLabel(tutorial, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for the program to finish\n4. Enjoy the saved time!", font=("", 20))
-        tutorial_text1.pack()
-        tutorial_text2 = ctk.CTkLabel(tutorial, text="Functions", font=("", 20))
-        tutorial_text2.pack(pady=(25,0))
-        tutorial_text3 = ctk.CTkLabel(tutorial, text="a) File sorting", font=("", 16))
-        tutorial_text3.pack()
-        tutorial_text4 = ctk.CTkLabel(tutorial, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/year/month/file", font=("", 13))
-        tutorial_text4.pack(pady=(0,10))
-        tutorial_text5 = ctk.CTkLabel(tutorial, text="b) Finding duplicates", font=("", 16))
-        tutorial_text5.pack()
-        tutorial_text6 = ctk.CTkLabel(tutorial, text="Finds all the duplicates in your chosen folder\nand puts them in a separate folder.\ndesired_folder/duplicates/files", font=("", 13))
-        tutorial_text6.pack(pady=(0,10))
-        tutorial_text7 = ctk.CTkLabel(tutorial, text="All changes all revertable and the duplicates aren't deleted.", font=("Roboto Bold", 12))
-        tutorial_text7.pack(pady=(15,5))
+def execute():
+    if actions_find.get():
+        duplicate_finder()
+        print("Finding duplicates...")
+    if actions_water.get():
+        print("Adding watermarks...")
+    if actions_sort.get():
+        sort()
+        print("Sorting...")
 
-        tutorial_close = ctk.CTkButton(tutorial, text="Got it", command=tutorial.destroy)
-        tutorial_close.pack()
-        tutorial.lift()
+def middle_reset():
+    for widget in middle.winfo_children():
+        widget.grid_remove()
+
+def organize_open():
+    global actions_water
+    global actions_find
+    global actions_sort
+    global middle
+    global currently_open
+
+    if currently_open == 0:
+        ()
     else:
-        tutorial.lift()
+        middle_reset()
+    organize_title.grid(sticky="nw", pady=18, padx=18)
+    folder_frame.grid(row=3, sticky="ew", padx=30, column=0)
+    folder_browser.grid(sticky="nw", pady=20, padx=(26,5), row=0, column=0)
+    folder_chosen.grid(sticky="nw", pady=20, row=0, column=1)
+    actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
+    actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
+    actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
+    actions_water.grid(sticky="nw", padx=32, pady=10, row=7)
+    actions_rename.grid(sticky="nw", padx=32, pady=10, row=8)
+    execute_button.grid(row=9, column=0, padx=104)
 
+    currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
+
+
+def settings_open():
+    global middle
+    global currently_open
+    if currently_open == 1:
+        ()
+    else:
+        middle_reset()
+    settings_label.grid(sticky="nw", pady=18, padx=18)
+    find_settings.grid(row=6, column=0, padx=(20,18), pady=20, sticky="ew")
+    sort_settings.grid(row=7, column=0, padx=(18,20), pady=20, sticky="ew")
+    water_settings.grid(row=6, column=2, padx=(20,18), pady=20, sticky="ew")
+    rename_settings.grid(row=7, column=2, padx=(18,20), pady=20, sticky="ew")
+
+    settings_duplicate_delete.grid(row=0, column=1, pady=8, padx=(4,8))
+    settings_duplicate_delete_text.grid(padx=(8,4), pady=8, row=0, column=0)
+    currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
+
+def tutorial_open():
+    global middle
+    global currently_open
+    if currently_open == 2:
+        ()
+    else:
+        middle_reset()
+    tutorial_label.grid(sticky="nw", pady=18, padx=18)
+    currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
 #tk
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -309,7 +349,6 @@ canvas = ctk.CTk()
 canvas.title("Specular")
 canvas.geometry("1024x576")
 canvas.resizable(width=False, height=False)
-
 
 #left
 left = ctk.CTkFrame(canvas, width=200, height=576, fg_color="#1f2029", corner_radius=0)
@@ -321,6 +360,15 @@ left.grid_rowconfigure(10, weight=1)
 left_title = ctk.CTkLabel(left, text="Specular", font=("Bahnschrift Light Condensed", 32))
 left_title.grid(sticky="nw", pady=18, padx=18)
 
+organize_button = ctk.CTkButton(left, text="Organize", font=("Bahnschrift Light Condencsed", 16), command=organize_open)
+organize_button.grid(sticky="nw", pady=(36, 18), padx=18)
+
+settings_button = ctk.CTkButton(left, text="Settings", font=("Bahnschrift Light Condencsed", 16), command=settings_open)
+settings_button.grid(sticky="nw", pady=18, padx=18)
+
+tutorial_button = ctk.CTkButton(left, text="Tutorial", font=("Bahnschrift Light Condencsed", 16), command=tutorial_open)
+tutorial_button.grid(sticky="nw", pady=18, padx=18)
+
 #middle
 middle = ctk.CTkFrame(canvas, width=564, height=576, fg_color="#20222e", corner_radius=0)
 middle.grid(row = 0, column = 1)
@@ -328,27 +376,63 @@ middle.grid_propagate(False)
 middle.grid_columnconfigure(2, weight=1)
 middle.grid_rowconfigure(10, weight=1)
 
+#tutorial
+tutorial_label = ctk.CTkLabel(middle, text="Tutorial", font=("Bahnschrift Light Condensed", 32))
+tutorial_text1 = ctk.CTkLabel(middle, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for thprogram to finish\n4. Enjoy the saved time!", font=("Bahnschrift Light Condensed", 20))
+tutorial_text2 = ctk.CTkLabel(middle, text="Functions", font=("Bahnschrift Light Condensed", 20))
+tutorial_text4 = ctk.CTkLabel(middle, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/yeamonth/file", font=("Bahnschrift Light Condensed", 13))
+tutorial_text5 = ctk.CTkLabel(middle, text="b) Finding duplicates", font=("Bahnschrift Light Condensed", 16))
+tutorial_text6 = ctk.CTkLabel(middle, text="Finds all the duplicates in your chosen folder\nand puts them in separate folder.\ndesired_folder/duplicates/files", font=("Bahnschrift Light Condensed", 13))
+tutorial_text7 = ctk.CTkLabel(middle, text="All changes all revertable and the duplicates aren't deleted.", font=("Bahnschrift Light Condensed", 12))
+
+#settings
+settings_label = ctk.CTkLabel(middle, text="Settings", font=("Bahnschrift Light Condensed", 32))
+
+find_settings = ctk.CTkFrame(middle, width=244, height=196, fg_color="#1f2029")
+find_settings.grid_rowconfigure(2, weight=1)
+find_settings.grid_propagate(False)
+find_settings.columnconfigure(1, weight=1)
+sort_settings = ctk.CTkFrame(middle, width=244, height=196, fg_color="#1f2029")
+sort_settings.grid_rowconfigure(2, weight=1)
+sort_settings.grid_propagate(False)
+sort_settings.columnconfigure(1, weight=1)
+water_settings = ctk.CTkFrame(middle, width=244, height=196, fg_color="#1f2029")
+water_settings.grid_rowconfigure(3, weight=1)
+water_settings.grid_propagate(False)
+water_settings.columnconfigure(1, weight=1)
+rename_settings = ctk.CTkFrame(middle, width=244, height=196, fg_color="#1f2029")
+rename_settings.grid_rowconfigure(2, weight=1)
+rename_settings.grid_propagate(False)
+rename_settings.columnconfigure(1, weight=1)
+
+settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates should be - ", font=("Bahnschrift Light Condencsed", 16))
+settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condencsed", 16))
+settings_duplicate_delete.set("Move to a folder")
+
 #organize
-
 organize_title = ctk.CTkLabel(middle, text="Organize", font=("Bahnschrift Light Condensed", 30))
-organize_title.grid(sticky="nw", pady=18, padx=18)
-
-folder_browser = ctk.CTkButton(middle, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18))
-folder_browser.grid(sticky="nw", pady=20, padx=(26,5), row=3, column=0)
-folder_chosen = ctk.CTkLabel(middle, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
-folder_chosen.grid(sticky="nw", pady=20, row=3, column=1)
-
-actions_title = ctk.CTkLabel(middle, text="What should happen", text_color="grey", font=("Bahnschrift Light Condensed", 20))
-actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
+folder_frame = ctk.CTkFrame(middle, fg_color="#1f2029", height=32, width=324)
+folder_browser = ctk.CTkButton(folder_frame, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18))
+folder_chosen = ctk.CTkLabel(folder_frame, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
+actions_title = ctk.CTkLabel(middle, text="Functions", text_color="grey", font=("Bahnschrift Light Condensed", 20))
 actions_find = ctk.CTkCheckBox(middle, text="Find duplicates", font=("Bahnschrift Light Condensed", 16))
-actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
-actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
-actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
 actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift Light Condensed", 16))
-actions_water.grid(sticky="nw", padx=32, pady=10, row=7)
+actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
+actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift Light Condensed", 16))
+execute_button = ctk.CTkButton(middle, text="Execute", command=(execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
 
-execute_button = ctk.CTkButton(middle, text="Execute", command=(), font=("Bahnschrift Light Condensed", 18))
-execute_button.grid(row=8, column = 1)
+
+#show tutorial
+if tutorial_seen == 0:
+    tutorial_open()
+    tutorial_seen = 1
+    try:
+        with open("memory.json", "w") as f:
+            json.dump(tutorial_seen, f)
+    except FileNotFoundError:
+        print("File not found.")
+else:
+    organize_open()
 
 #right
 right = ctk.CTkFrame(canvas, width=260, height=576, fg_color="#1f2029", corner_radius=0)
@@ -363,22 +447,8 @@ right_title.grid(sticky="nw", pady=18, padx=18)
 status = ctk.CTkLabel(right, text="Sitting...", font=("Bahnschrift Light Condensed", 24), text_color="grey")
 status.grid(row=2, sticky="nw", padx=20)
 
-#tutorial
-try:
-    with open("memory.json", "r") as f:
-        tutorial_seen = json.load(f)
-except FileNotFoundError:
-    print("File not found.")
 
-if tutorial_seen == 0:
-    tutorial_open()
-    tutorial_seen = 1
-    try:
-        with open("memory.json", "w") as f:
-            json.dump(tutorial_seen, f)
-    except FileNotFoundError:
-        print("File not found.")
 canvas.mainloop()
 
 
-#TODO: Learn TK finally, v menu, ked pouzivatel vyberie tlacidlo, nech sa menu schová a príde to, čo chceli
+#TODO: Continue working on settings, then finish the restore functions in organize.
