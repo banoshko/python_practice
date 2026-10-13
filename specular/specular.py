@@ -1,4 +1,4 @@
-#This is my attempt at making an actually sellable product.
+ #This is my attempt at making an actually sellable product.
 #Not even 2 weeks into python at this point
 #Start - Sunday, 27th Sep. 2026
 
@@ -139,8 +139,8 @@ def duplicate_finder():
         bar_text = ctk.CTkLabel(right, text="")
         seen = {}
         size = 0
+        bar.set(0)
         for item in target_folder.iterdir():
-            bar.set(0)
             bar_text.grid(row=4)
             if item.is_file():
                 hash = get_hash(item)
@@ -325,7 +325,7 @@ left_title.grid(sticky="nw", pady=18, padx=18)
 middle = ctk.CTkFrame(canvas, width=564, height=576, fg_color="#20222e", corner_radius=0)
 middle.grid(row = 0, column = 1)
 middle.grid_propagate(False)
-middle.grid_columnconfigure(1, weight=1)
+middle.grid_columnconfigure(2, weight=1)
 middle.grid_rowconfigure(10, weight=1)
 
 #organize
@@ -333,11 +333,22 @@ middle.grid_rowconfigure(10, weight=1)
 organize_title = ctk.CTkLabel(middle, text="Organize", font=("Bahnschrift Light Condensed", 30))
 organize_title.grid(sticky="nw", pady=18, padx=18)
 
-folder_browser = ctk.CTkButton(middle, text="Choose a folder", command=pick_folder)
-folder_browser.grid(sticky="nw", pady=20, padx=(26,10), row=3, column=0)
-folder_chosen = ctk.CTkLabel(middle, text="Folder chosen:", font=("", 12), text_color="grey")
+folder_browser = ctk.CTkButton(middle, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18))
+folder_browser.grid(sticky="nw", pady=20, padx=(26,5), row=3, column=0)
+folder_chosen = ctk.CTkLabel(middle, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
 folder_chosen.grid(sticky="nw", pady=20, row=3, column=1)
 
+actions_title = ctk.CTkLabel(middle, text="What should happen", text_color="grey", font=("Bahnschrift Light Condensed", 20))
+actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
+actions_find = ctk.CTkCheckBox(middle, text="Find duplicates", font=("Bahnschrift Light Condensed", 16))
+actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
+actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
+actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
+actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift Light Condensed", 16))
+actions_water.grid(sticky="nw", padx=32, pady=10, row=7)
+
+execute_button = ctk.CTkButton(middle, text="Execute", command=(), font=("Bahnschrift Light Condensed", 18))
+execute_button.grid(row=8, column = 1)
 
 #right
 right = ctk.CTkFrame(canvas, width=260, height=576, fg_color="#1f2029", corner_radius=0)
