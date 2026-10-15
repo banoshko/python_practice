@@ -172,7 +172,7 @@ def duplicate_finder():
                     if percent > 80:
                         status.configure(text="Almost there!")
                     else:
-                        status.configure(text="Finding all the duplicates")
+                        status.configure(text="Finding all the duplica  tes")
                     bar_text.configure(text = f"{percent :.2f}%")
                     bar.set(percent/100)
                     canvas.update_idletasks()
@@ -260,7 +260,13 @@ def watermark():
 
 def rename():
     try:
-        ()
+        if settings_rename_pattern.get() == "date + number":
+            ()
+        elif settings_rename_pattern.get() == "original name + number":
+            ()
+        else:
+            if len(settings_rename_custom.get('1.0', "end-1c")) > 12:
+                ()
     except NameError:
         print("You must pick a folder.")
         status.configure(text = "You must pick a folder.")
@@ -324,6 +330,9 @@ def organize_open():
         ()
     else:
         middle_reset()
+    middle.grid_columnconfigure(2, weight=1)
+    middle.grid_rowconfigure(10, weight=1)
+    middle.grid_rowconfigure(7, weight=0)
     organize_title.grid(sticky="nw", pady=18, padx=18)
     folder_frame.grid(row=3, sticky="ew", padx=30, column=0)
     folder_browser.grid(sticky="nw", pady=20, padx=(26,5), row=0, column=0)
@@ -346,37 +355,36 @@ def settings_open():
     else:
         middle_reset()
         middle.grid_columnconfigure(0, weight=1)
-        middle.grid_rowconfigure(6, weight=1)
+        middle.grid_rowconfigure(7, weight=1)
         settings_label.grid(sticky="nw", pady=18, padx=18)
         find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
         sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
         water_settings.grid(row=5, column=0, padx=20, pady=12, sticky="ew")
-        rename_settings.grid(row=7, column=0, padx=20, pady=12, sticky="ew")
+        rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
 
-        settings_duplicate_delete_text.grid(padx=(8,4), pady=8, row=0, column=0)
-        settings_duplicate_delete.grid(row=0, column=1, padx=(4,8), pady=8)
+        settings_duplicate_delete_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+        settings_duplicate_delete.grid(row=0, column=1, padx=16, pady=8, sticky="e")
 
-        settings_sort_sortby_text.grid(padx=(4,8), pady=8, row=0, column=0)
-        settings_sort_sortby.grid(row=0, column=1, padx=(8,4), pady=8)
-        settings_sort_structure_text.grid(padx=(4,8), pady=8, row=1, column=0)
-        settings_sort_structure.grid(row=1, column=1, padx=(8,4), pady=8)
+        settings_sort_sortby_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+        settings_sort_sortby.grid(row=0, column=1, padx=16, pady=8, sticky="e")
+        settings_sort_structure_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
+        settings_sort_structure.grid(row=1, column=1, padx=16, pady=8, sticky="e")
 
-        settings_watermark_image_text.grid(padx=(4,8), pady=8, row=0, column=0)
-        settings_watermark_image.grid(row=0, column=1, padx=(8,4), pady=8)
-        settings_watermark_corner_text.grid(padx=(4,8), pady=8, row=1, column=0)
-        settings_watermark_corner.grid(row=1, column=1, padx=(8,4), pady=8)
+        settings_watermark_image_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+        settings_watermark_image.grid(row=0, column=1, padx=16, pady=8, sticky="e")
+        settings_watermark_corner_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
+        settings_watermark_corner.grid(row=1, column=1, padx=16, pady=8, sticky="e")
 
-        watermark_size_frame.grid(row=2,column=0, padx=(18,0))
-        settings_watermark_size_text.grid(padx=(4,8), pady=8, row=0, column=0)
-        set_wat_minus.grid(row=0,column=1, padx=(18,0))
-        settings_watermark_size.grid(row=0, column=2, padx=4, pady=8)
-        set_wat_plus.grid(row=0,column=3, padx=(0,18))
+        watermark_size_frame.grid(row=2,column=0, sticky="ew", columnspan=2)
+        settings_watermark_size_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+        set_wat_minus.grid(row=0,column=1, padx=(65,0), sticky="w")
+        settings_watermark_size.grid(row=0, column=2, padx=5, pady=8, sticky="w")
+        set_wat_plus.grid(row=0,column=3, padx=(0,16), sticky="w")
 
-        settings_rename_pattern_text.grid(padx=(4,8), pady=8, row=0, column=0)
-        settings_rename_pattern.grid(row=0, column=1, padx=(8,4), pady=8)
+        settings_rename_pattern_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+        settings_rename_pattern.grid(row=0, column=1, padx=16, pady=8, sticky="e")
     currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
-    middle.grid_columnconfigure(2, weight=1)
-    middle.grid_rowconfigure(10, weight=1)
+    
 
     
 def tutorial_open():
@@ -396,7 +404,7 @@ canvas.title("Specular")
 canvas.geometry("1024x576")
 canvas.resizable(width=False, height=False)
 logo = ImageTk.PhotoImage(Image.open("specular_logo.png"))
-canvas.after(100, lambda: canvas.iconphoto(False, logo))
+canvas.after(500, lambda: canvas.iconphoto(False, logo))
 
 #left
 left = ctk.CTkFrame(canvas, width=200, height=576, fg_color="#1f2029", corner_radius=0)
@@ -440,7 +448,7 @@ find_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
 find_settings.grid_rowconfigure(2, weight=1)
 find_settings.grid_propagate(False)
 find_settings.grid_columnconfigure(1, weight=1)
-sort_settings = ctk.CTkFrame(middle, width=34, height=96, fg_color="#1f2029")
+sort_settings = ctk.CTkFrame(middle, width=364, height=96, fg_color="#1f2029")
 sort_settings.grid_rowconfigure(2, weight=1)
 sort_settings.grid_propagate(False)
 sort_settings.grid_columnconfigure(1, weight=1)
@@ -448,65 +456,97 @@ water_settings = ctk.CTkFrame(middle, width=364, height=136, fg_color="#1f2029")
 water_settings.grid_rowconfigure(3, weight=1)
 water_settings.grid_propagate(False)
 water_settings.grid_columnconfigure(1, weight=1)
-rename_settings = ctk.CTkFrame(middle, width=364, height=96, fg_color="#1f2029")
+rename_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
 rename_settings.grid_rowconfigure(2, weight=1)
 rename_settings.grid_propagate(False)
 rename_settings.grid_columnconfigure(1, weight=1)
 
 #Find Settings
 settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates are: ", font=("Bahnschrift Light Condencsed", 16))
-settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condencsed", 16))
+settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
 settings_duplicate_delete.set("Moved to a folder")
 
 #Sort Settings
 settings_sort_structure_text = ctk.CTkLabel(sort_settings, text="Sorted structure: ", font=("Bahnschrift Light Condencsed", 16))
-settings_sort_structure = ctk.CTkOptionMenu(sort_settings, values=["year/month/day", "year/month"], font=("Bahnschrift Light Condencsed", 16))
+settings_sort_structure = ctk.CTkOptionMenu(sort_settings, values=["year/month/day", "year/month"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
 settings_sort_structure.set("year/month/day")
 
 settings_sort_sortby_text = ctk.CTkLabel(sort_settings, text="Sort by: ", font=("Bahnschrift Light Condencsed", 16))
-settings_sort_sortby = ctk.CTkOptionMenu(sort_settings, values=["Date taken", "Date modified"], font=("Bahnschrift Light Condencsed", 16))
+settings_sort_sortby = ctk.CTkOptionMenu(sort_settings, values=["Date taken", "Date modified"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
 settings_sort_sortby.set("Date taken")
 
 #Rename Settings
 def rename_pattern_changed(choice):
     if choice=="custom_name + number":
-        settings_rename_custom_text.grid(padx=(4,8), pady=8, row=1, column=0)
-        settings_rename_custom.grid(row=1, column=1, padx=(8,4), pady=8)
+        rename_settings.configure(height=96)
+        settings_rename_custom_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
+        settings_rename_custom.grid(row=1, column=1, padx=16, pady=8, sticky="e")
+    else:
+        rename_settings.configure(height=56)
+        settings_rename_custom_text.grid_remove()
+        settings_rename_custom.grid_remove()
 settings_rename_custom_text = ctk.CTkLabel(rename_settings, text="Custom name: ", font=("Bahnschrift Light Condencsed", 16))
-settings_rename_custom = ctk.CTkTextbox(rename_settings)
+settings_rename_custom = ctk.CTkTextbox(rename_settings, height=32, width=212)
 settings_rename_pattern_text = ctk.CTkLabel(rename_settings, text="Renaming pattern: ", font=("Bahnschrift Light Condencsed", 16))
-settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["date + number", "original name + number", "custom_name + number"], font=("Bahnschrift Light Condencsed", 16), command=rename_pattern_changed)
+settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["date + number", "original name + number", "custom_name + number"], font=("Bahnschrift Light Condencsed", 16), command=rename_pattern_changed, width=212, anchor="center")
 settings_rename_pattern.set("date + number")
 
 
 #Watermark Settings
 settings_watermark_image_text = ctk.CTkLabel(water_settings, text="Watermark image: ", font=("Bahnschrift Light Condencsed", 16))
-settings_watermark_image = ctk.CTkButton(water_settings, text="Choose an image", font=("Bahnschrift Light Condencsed", 16), command=filedialog.askopenfile)
+settings_watermark_image = ctk.CTkButton(water_settings, width=212, text="Choose an image", font=("Bahnschrift Light Condencsed", 16), command=filedialog.askopenfile)
 settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark postition: ", font=("Bahnschrift Light Condencsed", 16))
-settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"], font=("Bahnschrift Light Condencsed", 16))
+settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
 settings_watermark_corner.set("Top Right")
 
 watermark_size_frame = ctk.CTkFrame(water_settings, fg_color="transparent")
 watermark_size_frame.grid_columnconfigure(3, weight=1)
 settings_watermark_size_text = ctk.CTkLabel(watermark_size_frame, text="Watermark size: ", font=("Bahnschrift Light Condencsed", 16))
-settings_watermark_size = ctk.CTkEntry(watermark_size_frame, justify="center", width=48)
+last_good=20
+def size_check(event=None):
+    global last_good
+    try:
+        if int(settings_watermark_size.get()) < 1 or int(settings_watermark_size.get()) > 150:
+            settings_watermark_size.delete(0, "end")
+            settings_watermark_size.insert(0, last_good)
+
+        else:
+            last_good = settings_watermark_size.get()
+    except ValueError:
+        settings_watermark_size.delete(0, "end")
+        settings_watermark_size.insert(0,last_good)
+settings_watermark_size = ctk.CTkEntry(watermark_size_frame, justify="center", width=104)
+settings_watermark_size.bind("<FocusOut>", size_check)
 settings_watermark_size.insert(0, "20")
+
 def minus():
+    global last_good
     try:
         updated = int(settings_watermark_size.get()) - 1
+        if updated < 1:
+            return
+        else:
+            last_good=updated
         settings_watermark_size.delete(0, "end")
-        settings_watermark_size.insert(0, str(updated))
+        settings_watermark_size.insert(0, str(last_good))
     except ValueError:
-        pass
+        settings_watermark_size.delete(0, "end")
+        settings_watermark_size.insert(0, str(last_good))
 def plus():
+    global last_good
     try:
         updated = int(settings_watermark_size.get()) + 1
+        if updated > 150:
+            return   
+        else:
+            last_good=updated
         settings_watermark_size.delete(0, "end")
         settings_watermark_size.insert(0, str(updated))
     except ValueError:
-        pass
-set_wat_minus = ctk.CTkButton(watermark_size_frame, text="-", command=minus, font=("Bahnschrift Light Condencsed", 16), width=24)
-set_wat_plus = ctk.CTkButton(watermark_size_frame, text="+", command=plus, font=("Bahnschrift Light Condencsed", 16), width=24)
+        settings_watermark_size.delete(0, "end")
+        settings_watermark_size.insert(0, str(last_good))
+set_wat_minus = ctk.CTkButton(watermark_size_frame, text="-", command=minus, font=("Bahnschrift Light Condencsed", 16), width=49)
+set_wat_plus = ctk.CTkButton(watermark_size_frame, text="+", command=plus, font=("Bahnschrift Light Condencsed", 16), width=49)
 #organize
 organize_title = ctk.CTkLabel(middle, text="Organize", font=("Bahnschrift Light Condensed", 30))
 folder_frame = ctk.CTkFrame(middle, fg_color="#1f2029", height=32, width=324)
@@ -549,3 +589,4 @@ canvas.mainloop()
 
 
 #TODO: Continue working on settings, then finish the restore functions in organize. Add a rename and watermark functions
+#play around with the custom name, add a checkbox to check whether its oki:>
