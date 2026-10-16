@@ -9,6 +9,8 @@ import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image, ImageTk
 import json
+import threading
+import queue
 
 #Developer settings
 month_dict = {
@@ -19,7 +21,7 @@ suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)"
 ]
 basic = "Sitting..." #what the idle status says
-
+q = queue.Queue()
 try:
     with open("memory.json", "r") as f:
         tutorial_seen = json.load(f)
@@ -31,7 +33,34 @@ if tutorial_seen == 0:
 else:
     currently_open = 0  
 #Script itself
+def start_execute(task):
+    threading.Thread(target=task, daemon=True).start()
+def run_execute():
+    start_execute(execute)
+
+def check_messages():
+    try:
+        while True:
+            kind, value = q.get_nowait()
+            if kind == "status":
+                status.configure(text=value)
+            elif kind == "bar_text":
+                bar_text.configure(text=value)
+            elif kind == "destroy_status":
+                status.destroy()
+            elif kind == "bar_text_destroy":
+                bar_text.destroy()
+            elif kind == "bar_destroy":
+                bar.destroy()
+            canvas.update_idletasks()
+    except queue.Empty:
+        pass
+    canvas.after(20, check_messages)
+
 def sort():
+    global bar_text
+    global status
+    global bar
     try:
         bar = ctk.CTkProgressBar(right)
         bar.set(0)
@@ -55,43 +84,45 @@ def sort():
                         percent = sum(f.stat().st_size for f in sorted_dir.rglob('*') if f.is_file())/(1024*1024*1024) / folder_size * 100
 
                         if percent > 80:
-                            status.configure(text="Almost there!")
+                            q.put(("status", "Almost there!"))
                         else:
-                            status.configure(text="Sorting...")
-                        bar_text.configure(text = f"{percent :.2f}%")
+                            q.put(("status", "Sorting..."))
+                        q.put(("bar_text", f"{percent :.2f}%"))
                         bar.set(percent/100)
                         canvas.update_idletasks()
                     except ZeroDivisionError:
                         ()
             except PermissionError:
                 print(f"Not permitted to move {item.name}.")
-        bar_text.configure(text = "100%")
-        status.configure(text="Files sorted!")
-        canvas.update_idletasks()
+        q.put(("bar_text", "100%"))
+        q.put(("status", "Files sorted!"))
         bar_text.after(3000)
-        bar_text.destroy()
-        bar.destroy()
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
         print("Files sorted.")
     except NameError:
         print("You must pick a folder.")
-        bar_text.destroy()
-        bar.destroy()
-        status.configure(text = "You must pick a folder.")
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+        q.put(("status", "You must pick a folder."))
         canvas.update_idletasks()
         status.after(1700)
-        status.configure(text=basic)
+        q.put(("status", basic))
         canvas.update_idletasks()
     except FileNotFoundError:
         print("File not found.")
-        bar_text.destroy()
-        bar.destroy()
-    status.configure(text=basic)
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+    q.put(("status", basic))
     canvas.update_idletasks()
     
 def restore_sort():
+    global bar_text
+    global status
+    global bar
     try:
         if target_folder.name == "sorted":
-            status.configure(text="Restoring sorted files...")
+            q.put(("status", "Restoring sorted files..."))
             canvas.update_idletasks()
             for year in target_folder.iterdir():
                 for month in year.iterdir():
@@ -101,17 +132,17 @@ def restore_sort():
                 year.rmdir()
             target_folder.rmdir()
             status.after(500)
-            status.configure(text="Everything back in its place!")
+            q.put(("status", "Everything back in its place!"))
             canvas.update_idletasks()
             status.after(3000)
-            status.configure(text=basic)
+            q.put(("status", basic))
             canvas.update_idletasks()
         elif not sorted_dir.exists():
-            status.configure(text="Nothing to restore.")
+            q.put(("status", "Nothing to restore."))
             canvas.update_idletasks()
             status.after(3000)
         else:
-            status.configure(text="Restoring sorted files...")  
+            q.put(("status", "Restoring sorted files..."))
             canvas.update_idletasks()  
             for year in sorted_dir.iterdir():
                 for month in year.iterdir():
@@ -121,23 +152,26 @@ def restore_sort():
                 year.rmdir()
             sorted_dir.rmdir()
             status.after(500)
-            status.configure(text="Everything back in its place!")
+            q.put(("status", "Everything back in its place!"))
             canvas.update_idletasks()
             status.after(3000)
     
     except NameError:
         print("You must pick a folder.")
-        status.configure(text = "You must pick a folder.")
+        q.put(("status", "You must pick a folder."))
         canvas.update_idletasks()
         status.after(1700)
     except FileNotFoundError:
         print("File not found.")
     except PermissionError:
         print("Not allowed to move this file.")
-    status.configure(text=basic)
+    q.put(("status", basic))
     canvas.update_idletasks()
 
 def duplicate_finder():
+    global bar_text
+    global status
+    global bar
     try:
         bar = ctk.CTkProgressBar(right)
         canvas.update_idletasks()
@@ -170,10 +204,10 @@ def duplicate_finder():
                     percent = size / folder_size * 100
 
                     if percent > 80:
-                        status.configure(text="Almost there!")
+                        q.put(("status", "Almost there!"))
                     else:
-                        status.configure(text="Finding all the duplica  tes")
-                    bar_text.configure(text = f"{percent :.2f}%")
+                        q.put(("status", "Finding all the duplicates"))
+                    q.put(("bar_text", f"{percent :.2f}%"))
                     bar.set(percent/100)
                     canvas.update_idletasks()
                 except ZeroDivisionError:
@@ -185,68 +219,71 @@ def duplicate_finder():
                     print(f"File {item.name} not found")
         
         if not duplicates.exists():
-            bar_text.destroy()
-            bar.destroy()
-            status.configure(text="No duplicates found!")
+            q.put(("bar_text_destroy", None))
+            q.put(("bar_destroy", None))
+            q.put(("status", "No duplicates found!"))
             canvas.update_idletasks()
             status.after(3000)
         else:
-            bar_text.configure(text = "100%")
-            status.configure(text="All duplicates found!")
+            q.put(("bar_text", "100%"))
+            q.put(("status", "All duplicates found!"))
             canvas.update_idletasks()
             bar_text.after(3000)
-            bar_text.destroy()
-            bar.destroy()
+            q.put(("bar_text_destroy", None))
+            q.put(("bar_destroy", None))
     except NameError:
-        bar_text.destroy()
-        bar.destroy()
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
         canvas.update_idletasks()
-        status.configure(text = "You must pick a folder.")
+        q.put(("status", "You must pick a folder."))
         canvas.update_idletasks()
         status.after(1700)
     except FileNotFoundError:
-        bar_text.destroy()
-        bar.destroy()
-    status.configure(text=basic)
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+    q.put(("status", basic))
     canvas.update_idletasks()
 
 def restore_duplicate():
+    global status
+    global bar_text
+    global bar
     try:
         if target_folder.name == "duplicates":
-            status.configure(text="Restoring duplicates...")  
+            q.put(("status", "Restoring duplicates..."))
             canvas.update_idletasks() 
             for item in target_folder.iterdir():
                 item.rename(target_folder.parent/item.name)
             target_folder.rmdir()
             status.after(500)
-            status.configure(text="Everything back in its place!")
+            q.put(("status", "Everything back in its place!"))
             canvas.update_idletasks()
             status.after(3000)
     
         elif not duplicates.exists():
-            status.configure(text="Nothing to restore.")
+            q.put(("status", "Nothing to restore."))
             canvas.update_idletasks()
             status.after(3000)
         else:
-            status.configure(text="Restoring duplicates...")  
+            q.put(("status", "Restoring duplicates..."))  
             canvas.update_idletasks() 
             for file in duplicates.iterdir():
                 if file.is_file():
                     file.rename(target_folder/file.name)
             duplicates.rmdir()
             status.after(500)
-            status.configure(text="Everything back in its place!")
+            q.put(("status", "Everything back in its place!"))
             canvas.update_idletasks()
             status.after(3000)
 
     except NameError:
         print("You must pick a folder.")
-        status.configure(text = "You must pick a folder.")
+        q.put(("status", "You must pick a folder."))
         canvas.update_idletasks()
         status.after(1700)
     except FileNotFoundError:
         print("File not found.")
-    status.configure(text=basic)
+    q.put(("status", basic))
     canvas.update_idletasks()
 
 def watermark():
@@ -254,7 +291,7 @@ def watermark():
         ()
     except NameError:
         print("You must pick a folder.")
-        status.configure(text = "You must pick a folder.")
+        q.put(("status", "You must pick a folder."))
         canvas.update_idletasks()
         status.after(1700)
 
@@ -269,7 +306,7 @@ def rename():
                 ()
     except NameError:
         print("You must pick a folder.")
-        status.configure(text = "You must pick a folder.")
+        q.put(("status", "You must pick a folder."))
         canvas.update_idletasks()
         status.after(1700)
 
@@ -405,6 +442,7 @@ canvas.geometry("1024x576")
 canvas.resizable(width=False, height=False)
 logo = ImageTk.PhotoImage(Image.open("specular_logo.png"))
 canvas.after(500, lambda: canvas.iconphoto(False, logo))
+check_messages()
 
 #left
 left = ctk.CTkFrame(canvas, width=200, height=576, fg_color="#1f2029", corner_radius=0)
@@ -557,7 +595,7 @@ actions_find = ctk.CTkCheckBox(middle, text="Find duplicates", font=("Bahnschrif
 actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift Light Condensed", 16))
 actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
 actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift Light Condensed", 16))
-execute_button = ctk.CTkButton(middle, text="Execute", command=(execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
+execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
 
 #show tutorial
 if tutorial_seen == 0:
@@ -583,7 +621,6 @@ right_title.grid(sticky="nw", pady=18, padx=18)
 
 status = ctk.CTkLabel(right, text="Sitting...", font=("Bahnschrift Light Condensed", 24), text_color="grey")
 status.grid(row=2, sticky="nw", padx=20)
-
 
 canvas.mainloop()
 
