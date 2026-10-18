@@ -20,7 +20,6 @@ years_used = []
 suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)"
 ]
-basic = "Sitting..." #what the idle status says
 q = queue.Queue()
 try:
     with open("memory.json", "r") as f:
@@ -46,12 +45,22 @@ def check_messages():
                 status.configure(text=value)
             elif kind == "bar_text":
                 bar_text.configure(text=value)
-            elif kind == "destroy_status":
-                status.destroy()
             elif kind == "bar_text_destroy":
-                bar_text.destroy()
+                bar_text.grid_forget()
             elif kind == "bar_destroy":
-                bar.destroy()
+                bar.grid_forget()
+            elif kind == "bar_set":
+                bar.set(value)
+            elif kind == "bar_show":
+                bar.grid(row=3, padx=25, sticky="w", pady=(8,2))
+            elif kind == "bar_text_show":
+                bar_text.grid(row=4, padx=32, sticky="w")
+            elif kind == "bar_hide":
+                bar.grid_forget()
+            elif kind == "bar_text_hide":
+                bar_text.grid_forget()
+            elif kind == "status_reset":
+                status.after(1700, lambda: status.configure(text="Sitting..."))
             canvas.update_idletasks()
     except queue.Empty:
         pass
@@ -62,13 +71,10 @@ def sort():
     global status
     global bar
     try:
-        bar = ctk.CTkProgressBar(right)
-        bar.set(0)
-        canvas.update_idletasks()
-        bar_text = ctk.CTkLabel(right, text="")
-        bar_text.grid(row=4)
+        q.put(("bar_set", 0))
         for item in target_folder.iterdir():
-            bar.grid(row=3, padx=20)
+            q.put(("bar_show", None))
+            q.put(("bar_text_show", None))
             try:
                 if item.is_file() or item.is_dir() and item.name not in ["duplicates", "sorted"]:
                     year = str(datetime.fromtimestamp(item.stat().st_mtime).year)
@@ -88,15 +94,14 @@ def sort():
                         else:
                             q.put(("status", "Sorting..."))
                         q.put(("bar_text", f"{percent :.2f}%"))
-                        bar.set(percent/100)
-                        canvas.update_idletasks()
+                        q.put(("bar_set", percent/100))
+                        q.put(("status", "Finished!"))
                     except ZeroDivisionError:
                         ()
             except PermissionError:
                 print(f"Not permitted to move {item.name}.")
         q.put(("bar_text", "100%"))
         q.put(("status", "Files sorted!"))
-        bar_text.after(3000)
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
         print("Files sorted.")
@@ -105,16 +110,12 @@ def sort():
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
-        canvas.update_idletasks()
-        status.after(1700)
-        q.put(("status", basic))
-        canvas.update_idletasks()
+        q.put(("status_reset", None))
     except FileNotFoundError:
         print("File not found.")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
-    q.put(("status", basic))
-    canvas.update_idletasks()
+    q.put(("status_reset", None))
     
 def restore_sort():
     global bar_text
@@ -123,7 +124,6 @@ def restore_sort():
     try:
         if target_folder.name == "sorted":
             q.put(("status", "Restoring sorted files..."))
-            canvas.update_idletasks()
             for year in target_folder.iterdir():
                 for month in year.iterdir():
                     for file in month.iterdir():
@@ -133,17 +133,11 @@ def restore_sort():
             target_folder.rmdir()
             status.after(500)
             q.put(("status", "Everything back in its place!"))
-            canvas.update_idletasks()
-            status.after(3000)
-            q.put(("status", basic))
-            canvas.update_idletasks()
+            q.put(("status_reset", None))
         elif not sorted_dir.exists():
             q.put(("status", "Nothing to restore."))
-            canvas.update_idletasks()
-            status.after(3000)
         else:
-            q.put(("status", "Restoring sorted files..."))
-            canvas.update_idletasks()  
+            q.put(("status", "Restoring sorted files...")) 
             for year in sorted_dir.iterdir():
                 for month in year.iterdir():
                     for file in month.iterdir():
@@ -153,35 +147,27 @@ def restore_sort():
             sorted_dir.rmdir()
             status.after(500)
             q.put(("status", "Everything back in its place!"))
-            canvas.update_idletasks()
-            status.after(3000)
     
     except NameError:
         print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
-        canvas.update_idletasks()
-        status.after(1700)
     except FileNotFoundError:
         print("File not found.")
     except PermissionError:
         print("Not allowed to move this file.")
-    q.put(("status", basic))
-    canvas.update_idletasks()
+    q.put(("status_reset", None))
 
 def duplicate_finder():
     global bar_text
     global status
     global bar
     try:
-        bar = ctk.CTkProgressBar(right)
-        canvas.update_idletasks()
-        bar_text = ctk.CTkLabel(right, text="")
         seen = {}
         size = 0
-        bar.set(0)
+        q.put(("bar_set", 0))
         for item in target_folder.iterdir():
-            bar.grid(row=3, padx=20)
-            bar_text.grid(row=4)
+            q.put(("bar_show", None))
+            q.put(("bar_text_show", None))
             if item.is_file():
                 hash = get_hash(item)
                 try:
@@ -191,11 +177,17 @@ def duplicate_finder():
 
                 if hash in seen:
                     if any(suf in seen[hash].stem for suf in suffix):
-                        duplicates.mkdir(exist_ok=True)
                         if any(suf in item.stem for suf in suffix):
-                            item.rename(duplicates/item.name)
+                            if settings_duplicate_delete.get() == "Moved to a folder":
+                                duplicates.mkdir(exist_ok=True)
+                                item.rename(duplicates/item.name)
+                            elif settings_duplicate_delete.get() == "Deleted":
+                                item.unlink()
                         else:
-                            seen[hash].rename(duplicates/seen[hash].name)
+                            if settings_duplicate_delete.get() == "Moved to a folder":
+                                seen[hash].rename(duplicates/seen[hash].name)
+                            elif settings_duplicate_delete.get() == "Deleted":
+                                seen[hash].unlink()
                             seen[hash] = Path(item)
                 else:
                     seen[hash] = Path(item)
@@ -208,8 +200,7 @@ def duplicate_finder():
                     else:
                         q.put(("status", "Finding all the duplicates"))
                     q.put(("bar_text", f"{percent :.2f}%"))
-                    bar.set(percent/100)
-                    canvas.update_idletasks()
+                    q.put(("bar_set", percent/100))
                 except ZeroDivisionError:
                     ()
             else:
@@ -217,32 +208,24 @@ def duplicate_finder():
                     size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
                 except FileNotFoundError:
                     print(f"File {item.name} not found")
-        
         if not duplicates.exists():
+            q.put(("bar_text", "100%"))
+            q.put(("status", "No duplicates found!"))
             q.put(("bar_text_destroy", None))
             q.put(("bar_destroy", None))
-            q.put(("status", "No duplicates found!"))
-            canvas.update_idletasks()
-            status.after(3000)
         else:
             q.put(("bar_text", "100%"))
             q.put(("status", "All duplicates found!"))
-            canvas.update_idletasks()
-            bar_text.after(3000)
             q.put(("bar_text_destroy", None))
             q.put(("bar_destroy", None))
     except NameError:
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
-        canvas.update_idletasks()
         q.put(("status", "You must pick a folder."))
-        canvas.update_idletasks()
-        status.after(1700)
     except FileNotFoundError:
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
-    q.put(("status", basic))
-    canvas.update_idletasks()
+    q.put(("status_reset", None))
 
 def restore_duplicate():
     global status
@@ -251,49 +234,35 @@ def restore_duplicate():
     try:
         if target_folder.name == "duplicates":
             q.put(("status", "Restoring duplicates..."))
-            canvas.update_idletasks() 
             for item in target_folder.iterdir():
                 item.rename(target_folder.parent/item.name)
             target_folder.rmdir()
             status.after(500)
             q.put(("status", "Everything back in its place!"))
-            canvas.update_idletasks()
-            status.after(3000)
     
         elif not duplicates.exists():
             q.put(("status", "Nothing to restore."))
-            canvas.update_idletasks()
-            status.after(3000)
         else:
             q.put(("status", "Restoring duplicates..."))  
-            canvas.update_idletasks() 
             for file in duplicates.iterdir():
                 if file.is_file():
                     file.rename(target_folder/file.name)
             duplicates.rmdir()
             status.after(500)
             q.put(("status", "Everything back in its place!"))
-            canvas.update_idletasks()
-            status.after(3000)
 
     except NameError:
         print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
-        canvas.update_idletasks()
-        status.after(1700)
     except FileNotFoundError:
         print("File not found.")
-    q.put(("status", basic))
-    canvas.update_idletasks()
-
+    q.put(("status_reset", None))
 def watermark():
     try:
         ()
     except NameError:
         print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
-        canvas.update_idletasks()
-        status.after(1700)
 
 def rename():
     try:
@@ -307,8 +276,6 @@ def rename():
     except NameError:
         print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
-        canvas.update_idletasks()
-        status.after(1700)
 
 def pick_folder():
     global target_folder
@@ -354,7 +321,7 @@ def execute():
 
 def middle_reset():
     for widget in middle.winfo_children():
-        widget.grid_remove()
+        widget.grid_forget()
 
 def organize_open():
     global actions_water
@@ -521,8 +488,8 @@ def rename_pattern_changed(choice):
         settings_rename_custom.grid(row=1, column=1, padx=16, pady=8, sticky="e")
     else:
         rename_settings.configure(height=56)
-        settings_rename_custom_text.grid_remove()
-        settings_rename_custom.grid_remove()
+        settings_rename_custom_text.grid_forget()
+        settings_rename_custom.grid_forget()
 settings_rename_custom_text = ctk.CTkLabel(rename_settings, text="Custom name: ", font=("Bahnschrift Light Condencsed", 16))
 settings_rename_custom = ctk.CTkTextbox(rename_settings, height=32, width=212)
 settings_rename_pattern_text = ctk.CTkLabel(rename_settings, text="Renaming pattern: ", font=("Bahnschrift Light Condencsed", 16))
@@ -621,9 +588,19 @@ right_title.grid(sticky="nw", pady=18, padx=18)
 
 status = ctk.CTkLabel(right, text="Sitting...", font=("Bahnschrift Light Condensed", 24), text_color="grey")
 status.grid(row=2, sticky="nw", padx=20)
-
+bar = ctk.CTkProgressBar(right)
+q.put(("bar_hide", None))
+bar_text = ctk.CTkLabel(right, text="")
+q.put(("bar_text_hide", None))
 canvas.mainloop()
-
 
 #TODO: Continue working on settings, then finish the restore functions in organize. Add a rename and watermark functions
 #play around with the custom name, add a checkbox to check whether its oki:>
+
+"""
+finished conditions:
+duplicates: 1/1
+sort: 0/2
+watermark: 0/3
+renaming: 0/1
+"""
