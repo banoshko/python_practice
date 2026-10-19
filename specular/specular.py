@@ -7,7 +7,7 @@ from pathlib import Path
 import hashlib
 import customtkinter as ctk
 from tkinter import filedialog
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ExifTags
 import json
 import threading
 import queue
@@ -21,16 +21,26 @@ suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "- copy", "- Copy"
 ]
 q = queue.Queue()
+
+
 try:
     with open("memory.json", "r") as f:
         tutorial_seen = json.load(f)
+
 except FileNotFoundError:
     print("File not found.")
+    memory = Path("memory.json")
+    memory.touch(exist_ok=True)
+    with open("memory.json", "w") as f:
+        json.dump(0, f)
+    tutorial_seen = 0
 
 if tutorial_seen == 0:
     currently_open = 1
 else:
     currently_open = 0  
+
+exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2"}
 #Script itself
 def start_execute(task):
     threading.Thread(target=task, daemon=True).start()
@@ -66,42 +76,111 @@ def check_messages():
         pass
     canvas.after(20, check_messages)
 
+def get_exif(path):
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if exif:
+                date_str = exif.get(36867) or exif.get(306)
+                
+                if not date_str:
+                    try:
+                        exif_ifd = exif.get_ifd(0x8769)
+                        date_str = exif_ifd.get(36867) or exif_ifd.get(306)
+                    except Exception:
+                        pass
+                if date_str:
+                    if isinstance(date_str, bytes):
+                        return date_str.decode('utf-8', errors='ignore').strip()
+                    return str(date_str).strip()
+    except Exception:
+        pass
+    return None
+
 def sort():
     global bar_text
     global status
     global bar
     try:
 
-    
         q.put(("bar_set", 0))
         for item in target_folder.iterdir():
             q.put(("bar_show", None))
             q.put(("bar_text_show", None))
+
             try:
                 if item.is_file() or item.is_dir() and item.name not in ["duplicates", "sorted"]:
-                    year = str(datetime.fromtimestamp(item.stat().st_mtime).year)
-                    month = month_dict[datetime.fromtimestamp(item.stat().st_mtime).month]
+                    if settings_sort_sortby.get() == "Date modified":
+                        file_time = datetime.fromtimestamp(item.stat().st_mtime)
+                        year = str(file_time.year)
+                        month = month_dict[file_time.month]
+                        day = str(file_time.day)
+                    elif settings_sort_sortby.get() == "Date taken":
+
+                        if item.suffix.lower() not in exif_suffix:
+                            file_time = datetime.fromtimestamp(item.stat().st_mtime)
+                            year = str(file_time.year)
+                            month = month_dict[file_time.month]
+                            day = str(file_time.day)
+                            print(f"{item.name} has an unsupported suffix. sorting by date modified")
+                        else:
+                            exif_string = get_exif(item)
+                            if exif_string:
+                                photo_date = datetime.strptime(exif_string, "%Y:%m:%d %H:%M:%S")
+                                year = str(photo_date.year)
+                                month = month_dict[photo_date.month]
+                                day = str(photo_date.day)
+                                print(f"1 - Sorted item {item.name} by date taken.")
+                            else:
+                                file_time = datetime.fromtimestamp(item.stat().st_mtime)
+                                year = str(file_time.year)
+                                month = month_dict[file_time.month]
+                                day = str(file_time.day)
+                                print(f"0 - Couldn't sort item {item.name} by date taken, sorted by date modified instead.")
+
                     sorted_dir.mkdir(exist_ok=True)
                     year_dir = sorted_dir / year
                     year_dir.mkdir(exist_ok=True)
                     month_dir = year_dir / month
                     month_dir.mkdir(exist_ok=True)
                     years_used.append(year)
-                    item.rename(month_dir/item.name)
+
+                    if settings_sort_structure.get() == "year/month":
+                        destination = Path(month_dir/item.name)
+
+                        if destination.exists():
+                            counter = 1
+                            while destination.exists():
+                                destination = Path(month_dir/f"{item.stem}_{counter}{item.suffix}")
+                                counter += 1
+                        item.rename(destination)
+
+                    elif settings_sort_structure.get() == "year/month/day":
+                        day_dir = month_dir / day
+                        day_dir.mkdir(exist_ok=True)
+                        destination = Path(day_dir/item.name)
+
+                        if destination.exists():
+                            counter = 1
+                            while destination.exists():
+                                destination = Path(day_dir/f"{item.stem}_{counter}{item.suffix}")
+                                counter += 1
+                        item.rename(destination)
                     try:
                         percent = sum(f.stat().st_size for f in sorted_dir.rglob('*') if f.is_file())/(1024*1024*1024) / folder_size * 100
-
                         if percent > 80:
                             q.put(("status", "Almost there!"))
                         else:
                             q.put(("status", "Sorting..."))
                         q.put(("bar_text", f"{percent :.2f}%"))
                         q.put(("bar_set", percent/100))
-                        q.put(("status", "Finished!"))
+
                     except ZeroDivisionError:
                         ()
             except PermissionError:
                 print(f"Not permitted to move {item.name}.")
+
+
         q.put(("bar_text", "100%"))
         q.put(("status", "Files sorted!"))
         q.put(("bar_text_destroy", None))
@@ -184,7 +263,14 @@ def duplicate_finder():
                     if any(suf in seen[hash].stem for suf in suffix):
                         if any(suf in item.stem for suf in suffix):
                             if settings_duplicate_delete.get() == "Moved to a folder":
-                                item.rename(duplicates/item.name)
+                                destination = Path(duplicates/item.name)
+
+                                if destination.exists():
+                                    counter = 1
+                                    while destination.exists():
+                                        destination = Path(duplicates/f"{item.stem}_{counter}{item.suffix}")
+                                        counter += 1
+                                item.rename(destination)
                             elif settings_duplicate_delete.get() == "Deleted":
                                 item.unlink()
                             changed = 1
