@@ -18,7 +18,7 @@ month_dict = {
 }
 years_used = []
 suffix = [
-    "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)"
+    "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "- copy", "- Copy"
 ]
 q = queue.Queue()
 try:
@@ -71,6 +71,8 @@ def sort():
     global status
     global bar
     try:
+
+    
         q.put(("bar_set", 0))
         for item in target_folder.iterdir():
             q.put(("bar_show", None))
@@ -162,6 +164,7 @@ def duplicate_finder():
     global status
     global bar
     try:
+        changed =0
         seen = {}
         size = 0
         q.put(("bar_set", 0))
@@ -176,25 +179,31 @@ def duplicate_finder():
                     print(f"File {item.name} not found")
 
                 if hash in seen:
+                    if settings_duplicate_delete.get() == "Moved to a folder":
+                        duplicates.mkdir(exist_ok=True)
                     if any(suf in seen[hash].stem for suf in suffix):
                         if any(suf in item.stem for suf in suffix):
                             if settings_duplicate_delete.get() == "Moved to a folder":
-                                duplicates.mkdir(exist_ok=True)
                                 item.rename(duplicates/item.name)
                             elif settings_duplicate_delete.get() == "Deleted":
                                 item.unlink()
+                            changed = 1
                         else:
                             if settings_duplicate_delete.get() == "Moved to a folder":
-                                seen[hash].rename(duplicates/seen[hash].name)
+                                try:
+                                    seen[hash].rename(duplicates/seen[hash].name)
+                                except PermissionError:
+                                    print(f"Permission error with {seen[hash]}")
                             elif settings_duplicate_delete.get() == "Deleted":
                                 seen[hash].unlink()
+                            changed = 1
                             seen[hash] = Path(item)
                 else:
                     seen[hash] = Path(item)
 
                 try:
                     percent = size / folder_size * 100
-
+                    print(item.name, percent)
                     if percent > 80:
                         q.put(("status", "Almost there!"))
                     else:
@@ -208,23 +217,40 @@ def duplicate_finder():
                     size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
                 except FileNotFoundError:
                     print(f"File {item.name} not found")
-        if not duplicates.exists():
-            q.put(("bar_text", "100%"))
-            q.put(("status", "No duplicates found!"))
-            q.put(("bar_text_destroy", None))
-            q.put(("bar_destroy", None))
-        else:
-            q.put(("bar_text", "100%"))
-            q.put(("status", "All duplicates found!"))
-            q.put(("bar_text_destroy", None))
-            q.put(("bar_destroy", None))
+        if settings_duplicate_delete.get() == "Moved to a folder":
+            if not duplicates.exists():
+                q.put(("bar_text", "100%"))
+                q.put(("status", "No duplicates found!"))
+            elif not any(duplicates.iterdir()):
+                q.put(("bar_text", "100%"))
+                q.put(("status", "No duplicates found!"))    
+            elif duplicates.exists():
+                if changed == 0:
+                    q.put(("bar_text", "100%"))
+                    q.put(("status", "No new duplicates!"))
+                elif changed == 1:
+                    q.put(("bar_text", "100%"))
+                    q.put(("status", "All duplicates found!"))
+        elif settings_duplicate_delete.get() == "Deleted":
+            if changed == 0:
+                q.put(("bar_text", "100%"))
+                q.put(("status", "No duplicates found!"))
+            elif changed == 1:
+                q.put(("bar_text", "100%"))
+                q.put(("status", "All duplicates terminated!"))
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
     except NameError:
+        print("Name Error")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
     except FileNotFoundError:
+        print("File Not Found Error")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
+    except PermissionError:
+        print("Permission Error Error")
     q.put(("status_reset", None))
 
 def restore_duplicate():
@@ -365,31 +391,7 @@ def settings_open():
         sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
         water_settings.grid(row=5, column=0, padx=20, pady=12, sticky="ew")
         rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
-
-        settings_duplicate_delete_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-        settings_duplicate_delete.grid(row=0, column=1, padx=16, pady=8, sticky="e")
-
-        settings_sort_sortby_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-        settings_sort_sortby.grid(row=0, column=1, padx=16, pady=8, sticky="e")
-        settings_sort_structure_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
-        settings_sort_structure.grid(row=1, column=1, padx=16, pady=8, sticky="e")
-
-        settings_watermark_image_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-        settings_watermark_image.grid(row=0, column=1, padx=16, pady=8, sticky="e")
-        settings_watermark_corner_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
-        settings_watermark_corner.grid(row=1, column=1, padx=16, pady=8, sticky="e")
-
-        watermark_size_frame.grid(row=2,column=0, sticky="ew", columnspan=2)
-        settings_watermark_size_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-        set_wat_minus.grid(row=0,column=1, padx=(65,0), sticky="w")
-        settings_watermark_size.grid(row=0, column=2, padx=5, pady=8, sticky="w")
-        set_wat_plus.grid(row=0,column=3, padx=(0,16), sticky="w")
-
-        settings_rename_pattern_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-        settings_rename_pattern.grid(row=0, column=1, padx=16, pady=8, sticky="e")
     currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
-    
-
     
 def tutorial_open():
     global middle
@@ -470,6 +472,8 @@ rename_settings.grid_columnconfigure(1, weight=1)
 settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates are: ", font=("Bahnschrift Light Condencsed", 16))
 settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
 settings_duplicate_delete.set("Moved to a folder")
+settings_duplicate_delete_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+settings_duplicate_delete.grid(row=0, column=1, padx=16, pady=8, sticky="e")
 
 #Sort Settings
 settings_sort_structure_text = ctk.CTkLabel(sort_settings, text="Sorted structure: ", font=("Bahnschrift Light Condencsed", 16))
@@ -479,7 +483,10 @@ settings_sort_structure.set("year/month/day")
 settings_sort_sortby_text = ctk.CTkLabel(sort_settings, text="Sort by: ", font=("Bahnschrift Light Condencsed", 16))
 settings_sort_sortby = ctk.CTkOptionMenu(sort_settings, values=["Date taken", "Date modified"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
 settings_sort_sortby.set("Date taken")
-
+settings_sort_sortby_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+settings_sort_sortby.grid(row=0, column=1, padx=16, pady=8, sticky="e")
+settings_sort_structure_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
+settings_sort_structure.grid(row=1, column=1, padx=16, pady=8, sticky="e")
 #Rename Settings
 def rename_pattern_changed(choice):
     if choice=="custom_name + number":
@@ -495,9 +502,11 @@ settings_rename_custom = ctk.CTkTextbox(rename_settings, height=32, width=212)
 settings_rename_pattern_text = ctk.CTkLabel(rename_settings, text="Renaming pattern: ", font=("Bahnschrift Light Condencsed", 16))
 settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["date + number", "original name + number", "custom_name + number"], font=("Bahnschrift Light Condencsed", 16), command=rename_pattern_changed, width=212, anchor="center")
 settings_rename_pattern.set("date + number")
-
+settings_rename_pattern_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+settings_rename_pattern.grid(row=0, column=1, padx=16, pady=8, sticky="e")
 
 #Watermark Settings
+
 settings_watermark_image_text = ctk.CTkLabel(water_settings, text="Watermark image: ", font=("Bahnschrift Light Condencsed", 16))
 settings_watermark_image = ctk.CTkButton(water_settings, width=212, text="Choose an image", font=("Bahnschrift Light Condencsed", 16), command=filedialog.askopenfile)
 settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark postition: ", font=("Bahnschrift Light Condencsed", 16))
@@ -505,8 +514,9 @@ settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right
 settings_watermark_corner.set("Top Right")
 
 watermark_size_frame = ctk.CTkFrame(water_settings, fg_color="transparent")
-watermark_size_frame.grid_columnconfigure(3, weight=1)
+watermark_size_frame.grid_columnconfigure(1, weight=1)
 settings_watermark_size_text = ctk.CTkLabel(watermark_size_frame, text="Watermark size: ", font=("Bahnschrift Light Condencsed", 16))
+watermark_size_frame.grid(row=2,column=0, sticky="ew", columnspan=2)
 last_good=20
 def size_check(event=None):
     global last_good
@@ -520,9 +530,19 @@ def size_check(event=None):
     except ValueError:
         settings_watermark_size.delete(0, "end")
         settings_watermark_size.insert(0,last_good)
-settings_watermark_size = ctk.CTkEntry(watermark_size_frame, justify="center", width=104)
+
+watermark_size_subframe = ctk.CTkFrame(watermark_size_frame, fg_color="transparent")
+watermark_size_subframe.grid_columnconfigure(2, weight=1)
+watermark_size_subframe.grid(column = 1, row=0, sticky="e")
+
+settings_watermark_size = ctk.CTkEntry(watermark_size_subframe, justify="center", width=104)
 settings_watermark_size.bind("<FocusOut>", size_check)
 settings_watermark_size.insert(0, "20")
+settings_watermark_image_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+settings_watermark_image.grid(row=0, column=1, padx=16, pady=8, sticky="e")
+settings_watermark_corner_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
+settings_watermark_corner.grid(row=1, column=1, padx=16, pady=8, sticky="e")
+settings_watermark_size_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
 
 def minus():
     global last_good
@@ -550,8 +570,13 @@ def plus():
     except ValueError:
         settings_watermark_size.delete(0, "end")
         settings_watermark_size.insert(0, str(last_good))
-set_wat_minus = ctk.CTkButton(watermark_size_frame, text="-", command=minus, font=("Bahnschrift Light Condencsed", 16), width=49)
-set_wat_plus = ctk.CTkButton(watermark_size_frame, text="+", command=plus, font=("Bahnschrift Light Condencsed", 16), width=49)
+
+
+set_wat_minus = ctk.CTkButton(watermark_size_subframe, text="-", command=minus, font=("Bahnschrift Light Condencsed", 16), width=49)
+set_wat_plus = ctk.CTkButton(watermark_size_subframe, text="+", command=plus, font=("Bahnschrift Light Condencsed", 16), width=49)
+set_wat_minus.grid(row=0,column=0, padx=(65,0), sticky="w")
+settings_watermark_size.grid(row=0, column=1, padx=5, pady=8, sticky="w")
+set_wat_plus.grid(row=0,column=2, padx=(0,16), sticky="w")
 #organize
 organize_title = ctk.CTkLabel(middle, text="Organize", font=("Bahnschrift Light Condensed", 30))
 folder_frame = ctk.CTkFrame(middle, fg_color="#1f2029", height=32, width=324)
