@@ -11,6 +11,7 @@ from PIL import Image, ImageTk, ExifTags
 import json
 import threading
 import queue
+import ctypes
 
 #Developer settings
 month_dict = {
@@ -18,7 +19,7 @@ month_dict = {
 }
 years_used = []
 suffix = [
-    "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "- copy", "- Copy"
+    "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)", "(16)", "(17)", "(18)", "(19)", "(20)", "- Copy"
 ]
 q = queue.Queue()
 
@@ -45,6 +46,7 @@ exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif", ".cr3", ".nef", ".arw", ".dng",
 def start_execute(task):
     threading.Thread(target=task, daemon=True).start()
 def run_execute():
+    q.put(("lock", None))
     start_execute(execute)
 
 def check_messages():
@@ -71,6 +73,10 @@ def check_messages():
                 bar_text.grid_forget()
             elif kind == "status_reset":
                 status.after(1700, lambda: status.configure(text="Sitting..."))
+            elif kind == "lock":
+                execute_button.configure(fg_color="#173348", state="disabled")
+            elif kind == "unlock":
+                execute_button.configure(fg_color="#1f6aa5", state="normal")
             canvas.update_idletasks()
     except queue.Empty:
         pass
@@ -410,6 +416,22 @@ def pick_folder():
     sorted_dir = Path(target_folder/"sorted")
     duplicates = Path(target_folder/"duplicates")
 
+allowed_characters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "_", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
+
+def custom_check(event=None):
+    text = settings_rename_custom.get('1.0', "end-1c")
+    for char in text:
+        if char not in allowed_characters:
+            print(f"Your custom file name can't have '{char}'!")
+            break
+    else:
+        print(f"Your custom file name is: '{text}'")
+
+#FINISH HERE
+
+
+
+
 def get_hash(filepath = Path):
     hasher = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -419,19 +441,29 @@ def get_hash(filepath = Path):
 
 def execute():
     if actions_find.get():
-        duplicate_finder()
         print("Finding duplicates...")
+        duplicate_finder()
     if actions_water.get():
-        watermark()
         print("Adding watermarks...")
+        watermark()
+
     if actions_rename.get():
-        rename()
         print("Renaming files...")
+        rename()
     if actions_sort.get():
-        sort()
         print("Sorting...")
+        sort()
+    q.put(("unlock", None))
+
+    
 
 def middle_reset():
+    global header
+    try:
+        for widget in header.winfo_children():
+            widget.grid_forget()
+    except Exception:
+        pass
     for widget in middle.winfo_children():
         widget.grid_forget()
 
@@ -449,6 +481,7 @@ def organize_open():
     middle.grid_columnconfigure(2, weight=1)
     middle.grid_rowconfigure(10, weight=1)
     middle.grid_rowconfigure(7, weight=0)
+    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
     folder_frame.grid(row=3, sticky="ew", padx=30, column=0)
     folder_browser.grid(sticky="nw", pady=20, padx=(26,5), row=0, column=0)
@@ -463,7 +496,7 @@ def organize_open():
     currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
 
 
-def settings_open():
+def settings_open(option=0):
     global middle
     global currently_open
     if currently_open == 1:
@@ -472,13 +505,39 @@ def settings_open():
         middle_reset()
         middle.grid_columnconfigure(0, weight=1)
         middle.grid_rowconfigure(7, weight=1)
-        settings_label.grid(sticky="nw", pady=18, padx=18)
+        header.grid(column=0, row=0,sticky="ew", pady=0)
+        settings_label.grid(sticky="nw", pady=18, padx=18, column=0, row=0)
+        settings_file.grid(sticky="se", pady=16, padx=8, column=1, row=0)
+        settings_pic.grid(sticky="se", pady=16, padx=(8,32), column=2, row=0)
+
+        #set picture options oki?
+        if option == 1:
+            water_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
+        else:
+            find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
+            sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
+            water_settings.grid(row=5, column=0, padx=20, pady=12, sticky="ew")
+            rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
+    currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
+
+def settings_change(option=0):
+    global middle
+    middle_reset()
+    middle.grid_columnconfigure(0, weight=1)
+    middle.grid_rowconfigure(7, weight=1)
+    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
+    settings_label.grid(sticky="nw", pady=18, padx=18, column=0, row=0)
+    settings_file.grid(sticky="se", pady=16, padx=8, column=1, row=0)
+    settings_pic.grid(sticky="se", pady=16, padx=(8,32), column=2, row=0)
+
+    #set picture options oki?
+    if option == 1:
+        water_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
+    else:
         find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
         sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
         water_settings.grid(row=5, column=0, padx=20, pady=12, sticky="ew")
         rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
-    currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
-    
 def tutorial_open():
     global middle
     global currently_open
@@ -486,17 +545,22 @@ def tutorial_open():
         ()
     else:
         middle_reset()
+        header.grid(column=0, row=0,sticky="ew", pady=(0,24))
+
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
 #tk
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("specular.organizer.v2")
 canvas = ctk.CTk()
 canvas.title("Specular")
 canvas.geometry("1024x576")
 canvas.resizable(width=False, height=False)
-logo = ImageTk.PhotoImage(Image.open("specular_logo.png"))
-canvas.after(500, lambda: canvas.iconphoto(False, logo))
+logo = ImageTk.PhotoImage(Image.open("specular_logo.ico"))
+canvas.after(500, lambda: canvas.iconbitmap("specular_logo.ico"))
+canvas.after(600, lambda: canvas.iconphoto(True, logo))
+
 check_messages()
 
 #left
@@ -522,11 +586,11 @@ tutorial_button.grid(sticky="nw", pady=18, padx=18)
 middle = ctk.CTkFrame(canvas, width=564, height=576, fg_color="#20222e", corner_radius=0)
 middle.grid(row = 0, column = 1)
 middle.grid_propagate(False)
-middle.grid_columnconfigure(2, weight=1)
+middle.grid_columnconfigure(0, weight=1)
 middle.grid_rowconfigure(10, weight=1)
-
+header = ctk.CTkFrame(middle, height=78, fg_color="#1f2028", corner_radius=0)
 #tutorial
-tutorial_label = ctk.CTkLabel(middle, text="Tutorial", font=("Bahnschrift Light Condensed", 32))
+tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 32))
 tutorial_text1 = ctk.CTkLabel(middle, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for thprogram to finish\n4. Enjoy the saved time!", font=("Bahnschrift Light Condensed", 20))
 tutorial_text2 = ctk.CTkLabel(middle, text="Functions", font=("Bahnschrift Light Condensed", 20))
 tutorial_text4 = ctk.CTkLabel(middle, text="Sorts all the files in your chosen folder.\ndesired_folder/sorted/yeamonth/file", font=("Bahnschrift Light Condensed", 13))
@@ -535,8 +599,7 @@ tutorial_text6 = ctk.CTkLabel(middle, text="Finds all the duplicates in your cho
 tutorial_text7 = ctk.CTkLabel(middle, text="All changes all revertable and the duplicates aren't deleted.", font=("Bahnschrift Light Condensed", 12))
 
 #settings
-settings_label = ctk.CTkLabel(middle, text="Settings", font=("Bahnschrift Light Condensed", 32))
-
+settings_label = ctk.CTkLabel(header, text="Settings", font=("Bahnschrift Light Condensed", 32))
 find_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
 find_settings.grid_rowconfigure(2, weight=1)
 find_settings.grid_propagate(False)
@@ -553,6 +616,10 @@ rename_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
 rename_settings.grid_rowconfigure(2, weight=1)
 rename_settings.grid_propagate(False)
 rename_settings.grid_columnconfigure(1, weight=1)
+
+#Settings choice
+settings_file = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condencsed", 16), width=142)
+settings_pic = ctk.CTkButton(header, command=lambda: settings_change(1), text="Picture Modifier Settings", font=("Bahnschrift Light Condencsed", 16), width=142)
 
 #Find Settings
 settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates are: ", font=("Bahnschrift Light Condencsed", 16))
@@ -585,6 +652,7 @@ def rename_pattern_changed(choice):
         settings_rename_custom.grid_forget()
 settings_rename_custom_text = ctk.CTkLabel(rename_settings, text="Custom name: ", font=("Bahnschrift Light Condencsed", 16))
 settings_rename_custom = ctk.CTkTextbox(rename_settings, height=32, width=212)
+settings_rename_custom.bind("<KeyRelease>", custom_check)
 settings_rename_pattern_text = ctk.CTkLabel(rename_settings, text="Renaming pattern: ", font=("Bahnschrift Light Condencsed", 16))
 settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["date + number", "original name + number", "custom_name + number"], font=("Bahnschrift Light Condencsed", 16), command=rename_pattern_changed, width=212, anchor="center")
 settings_rename_pattern.set("date + number")
@@ -664,7 +732,7 @@ set_wat_minus.grid(row=0,column=0, padx=(65,0), sticky="w")
 settings_watermark_size.grid(row=0, column=1, padx=5, pady=8, sticky="w")
 set_wat_plus.grid(row=0,column=2, padx=(0,16), sticky="w")
 #organize
-organize_title = ctk.CTkLabel(middle, text="Organize", font=("Bahnschrift Light Condensed", 30))
+organize_title = ctk.CTkLabel(header, text="Organize", font=("Bahnschrift Light Condensed", 30))
 folder_frame = ctk.CTkFrame(middle, fg_color="#1f2029", height=32, width=324)
 folder_browser = ctk.CTkButton(folder_frame, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18))
 folder_chosen = ctk.CTkLabel(folder_frame, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
@@ -674,7 +742,6 @@ actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift
 actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
 actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift Light Condensed", 16))
 execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
-
 #show tutorial
 if tutorial_seen == 0:
     tutorial_open()
@@ -708,10 +775,15 @@ canvas.mainloop()
 #TODO: Continue working on settings, then finish the restore functions in organize. Add a rename and watermark functions
 #play around with the custom name, add a checkbox to check whether its oki:>
 
+
+#WATERMARK WILL ONLY BE IN THE BOUGHT VERSION, THEREFORE IT'LL NOT BE DISPLAYED IN SETTINGS NOW.
+
+
+#!!! NOTE FOR TOMMOROW: CONTINUE WORKING ON THE FAILING GRID, THE GAP. CHATGPT COULDNT HELP WITH SHIT, GEMINI CANT SEE AND CLAUDE IS OUT OF TOKENS, I CANT FIGURE IT OUT EITHER. FINISH ITTTT
 """
 finished conditions:
 duplicates: 1/1
-sort: 0/2
+sort: 2/2
 watermark: 0/3
 renaming: 0/1
 """
