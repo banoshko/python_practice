@@ -22,7 +22,7 @@ suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)", "(16)", "(17)", "(18)", "(19)", "(20)", "- Copy"
 ]
 q = queue.Queue()
-
+check = 1
 
 try:
     with open("memory.json", "r") as f:
@@ -383,17 +383,125 @@ def watermark():
         q.put(("status", "You must pick a folder."))
 
 def rename():
+    global bar
+    global bar_text
+    global status
+    if check == 0:
+        q.put(("status", "Your custom name is not \nvalid."))
+        q.put(("status_reset", None))
+        return
+    q.put(("bar_set", 0))
+    q.put(("bar_show", None))
+    q.put(("bar_text_show", None))
+    size = 0
+    choice = settings_rename_pattern.get()
+    renameby = settings_rename_renameby.get()
+    custom = settings_rename_custom.get("1.0", "end-1c")
+    number = 0
     try:
-        if settings_rename_pattern.get() == "date + number":
-            ()
-        elif settings_rename_pattern.get() == "original name + number":
-            ()
-        else:
-            if len(settings_rename_custom.get('1.0', "end-1c")) > 12:
-                ()
+        count = len([f for f in target_folder.iterdir() if f.is_file()])
+        width = len(str(count))
+        files = [f for f in target_folder.iterdir() if f.is_file()]
+        for item in files:
+            counter = 0
+            if item.is_file():
+                try:
+                    size = size + item.stat().st_size / (1024*1024*1024)
+                except FileNotFoundError:
+                    print(f"File {item.name} not found")
+                number += 1
+                number_text = str(number).zfill(width)
+
+                try:
+                    percent = size / folder_size * 100
+                    if percent > 80:
+                        q.put(("status", "Almost there!"))
+                    else:
+                        q.put(("status", "Renaming the files"))
+                    q.put(("bar_text", f"{percent :.2f}%"))
+                    q.put(("bar_set", percent/100))
+                except ZeroDivisionError:
+                    ()
+                                    
+                if choice == "date + number":
+                    if renameby == "Date modified":
+                        file_time = datetime.fromtimestamp(item.stat().st_mtime)
+                        year = str(file_time.year)
+                        month = str(file_time.month).zfill(2)
+                        day = str(file_time.day).zfill(2)
+
+                        destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}{item.suffix}")
+                        if destination.exists():
+                            while destination.exists():
+                                counter += 1
+                                destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}_{counter}{item.suffix}")
+                        item.rename(destination)
+
+                    elif renameby == "Date taken":
+                        if item.suffix.lower() not in exif_suffix:
+                            file_time = datetime.fromtimestamp(item.stat().st_mtime)
+                            year = str(file_time.year)
+                            month = str(file_time.month).zfill(2)
+                            day = str(file_time.day).zfill(2)
+                            print(f"{item.name} has an unsupported suffix. renaming by date modified")
+                        else:
+                            exif_string = get_exif(item)
+                            if exif_string:
+                                photo_date = datetime.strptime(exif_string, "%Y:%m:%d %H:%M:%S")
+                                year = str(photo_date.year)
+                                month = str(photo_date.month).zfill(2)
+                                day = str(photo_date.day).zfill(2)
+                                print(f"1 - Renamed item {item.name} by date taken.")
+                            else:
+                                file_time = datetime.fromtimestamp(item.stat().st_mtime)
+                                year = str(file_time.year)
+                                month = str(file_time.month).zfill(2)
+                                day = str(file_time.day).zfill(2)
+                                print(f"0 - Couldn't rename item {item.name} by date taken, renaming by date modified instead.")
+
+                        destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}{item.suffix}")
+                        if destination.exists():
+                            while destination.exists():
+                                counter += 1
+                                destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}_{counter}{item.suffix}")
+                        item.rename(destination)
+                elif choice == "original name + number":
+                    destination = Path(f"{target_folder}/{item.stem}_{number_text}{item.suffix}")
+                    if destination.exists():
+                        while destination.exists():
+                            counter += 1
+                            destination = Path(f"{target_folder}/{item.stem}_{number_text}_{counter}{item.suffix}")
+                    item.rename(destination)
+
+                elif choice == "custom name + number":
+                    destination = Path(f"{target_folder}/{custom}_{number_text}{item.suffix}")
+                    if destination.exists():
+                        while destination.exists():
+                            counter += 1
+                            destination = Path(f"{target_folder}/{custom}_{number_text}_{counter}{item.suffix}")
+                    item.rename(destination)
+                
+            else:
+                try:
+                    size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
+                except FileNotFoundError:
+                    print(f"File {item.name} not found")
+        q.put(("bar_text", "100%"))
+        q.put(("status", "Files renamed!"))
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+        print("Files Renamed.")
     except NameError:
         print("You must pick a folder.")
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
+        q.put(("status_reset", None))
+    except FileNotFoundError:
+        print("File not found.")
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+    q.put(("status_reset", None))
 
 def pick_folder():
     global target_folder
@@ -417,21 +525,6 @@ def pick_folder():
     duplicates = Path(target_folder/"duplicates")
 
 allowed_characters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "_", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
-
-def custom_check(event=None):
-    text = settings_rename_custom.get('1.0', "end-1c")
-    for char in text:
-        if char not in allowed_characters:
-            print(f"Your custom file name can't have '{char}'!")
-            break
-    else:
-        print(f"Your custom file name is: '{text}'")
-
-#FINISH HERE
-
-
-
-
 def get_hash(filepath = Path):
     hasher = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -440,23 +533,25 @@ def get_hash(filepath = Path):
     return hasher.hexdigest()
 
 def execute():
-    if actions_find.get():
-        print("Finding duplicates...")
-        duplicate_finder()
-    if actions_water.get():
-        print("Adding watermarks...")
-        watermark()
+    try:
+        if actions_find.get():
+            print("Finding duplicates...")
+            duplicate_finder()
+        if actions_water.get():
+            print("Adding watermarks...")
+            watermark()
 
-    if actions_rename.get():
-        print("Renaming files...")
-        rename()
-    if actions_sort.get():
-        print("Sorting...")
-        sort()
-    q.put(("unlock", None))
-
+        if actions_rename.get():
+            print("Renaming files...")
+            rename()
+        if actions_sort.get():
+            print("Sorting...")
+            sort()
+        q.put(("unlock", None))
+    except Exception:
+        print("Error trying to execute.")
+        q.put(("unlock", None))
     
-
 def middle_reset():
     global header
     try:
@@ -478,46 +573,45 @@ def organize_open():
         ()
     else:
         middle_reset()
-    middle.grid_columnconfigure(2, weight=1)
+    
+    middle.grid_columnconfigure(2, weight=0)
     middle.grid_rowconfigure(10, weight=1)
     middle.grid_rowconfigure(7, weight=0)
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
-    folder_frame.grid(row=3, sticky="ew", padx=30, column=0)
-    folder_browser.grid(sticky="nw", pady=20, padx=(26,5), row=0, column=0)
-    folder_chosen.grid(sticky="nw", pady=20, row=0, column=1)
+    folder_browser.grid(sticky="ne", pady=(24,18), padx=(10,192), row=0, column=1)
+    folder_chosen.grid(sticky="ne", pady=(24,18), padx=(0,116), row=0, column=1)
     actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
     actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
-    actions_water.grid(sticky="nw", padx=32, pady=10, row=7)
-    actions_rename.grid(sticky="nw", padx=32, pady=10, row=8)
-    execute_button.grid(row=9, column=0, padx=104)
+    actions_rename.grid(sticky="nw", padx=32, pady=10, row=7)
+    execute_button.grid(row=9, column=0, padx=104,pady=10)
 
     currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
 
+def pictures_open():
+    ()
 
-def settings_open(option=0):
+def settings_open():
     global middle
     global currently_open
     if currently_open == 1:
         ()
     else:
         middle_reset()
-        middle.grid_columnconfigure(0, weight=1)
-        middle.grid_rowconfigure(7, weight=1)
-        header.grid(column=0, row=0,sticky="ew", pady=0)
-        settings_label.grid(sticky="nw", pady=18, padx=18, column=0, row=0)
-        settings_file.grid(sticky="se", pady=16, padx=8, column=1, row=0)
-        settings_pic.grid(sticky="se", pady=16, padx=(8,32), column=2, row=0)
+    middle.grid_columnconfigure(0, weight=1)
+    middle.grid_rowconfigure(7, weight=1)
+    header.grid(column=0, row=0,sticky="ew", pady=(0,16))
+    settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
+    settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
+    settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
+    folder_browser.grid(sticky="ne", pady=(24,18), padx=(10,192), row=0, column=1)
+    folder_chosen.grid(sticky="ne", pady=(24,18), padx=(0,116), row=0, column=1)
+    #set picture options oki?
 
-        #set picture options oki?
-        if option == 1:
-            water_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
-        else:
-            find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
-            sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
-            water_settings.grid(row=5, column=0, padx=20, pady=12, sticky="ew")
-            rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
+    find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
+    sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
+    rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
     currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
 
 def settings_change(option=0):
@@ -525,19 +619,18 @@ def settings_change(option=0):
     middle_reset()
     middle.grid_columnconfigure(0, weight=1)
     middle.grid_rowconfigure(7, weight=1)
-    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
-    settings_label.grid(sticky="nw", pady=18, padx=18, column=0, row=0)
-    settings_file.grid(sticky="se", pady=16, padx=8, column=1, row=0)
-    settings_pic.grid(sticky="se", pady=16, padx=(8,32), column=2, row=0)
+    header.grid(column=0, row=0,sticky="ew", pady=(0,16))
+    settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
+    settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
+    settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
 
-    #set picture options oki?
     if option == 1:
         water_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
     else:
         find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
         sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
-        water_settings.grid(row=5, column=0, padx=20, pady=12, sticky="ew")
         rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
+
 def tutorial_open():
     global middle
     global currently_open
@@ -545,9 +638,10 @@ def tutorial_open():
         ()
     else:
         middle_reset()
-        header.grid(column=0, row=0,sticky="ew", pady=(0,24))
-
+    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
+    folder_browser.grid(sticky="ne", pady=(24,18), padx=(10,192), row=0, column=1)
+    folder_chosen.grid(sticky="ne", pady=(24,18), padx=(0,116), row=0, column=1)
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
 #tk
 ctk.set_appearance_mode("dark")
@@ -573,13 +667,16 @@ left.grid_rowconfigure(10, weight=1)
 left_title = ctk.CTkLabel(left, text="Specular", font=("Bahnschrift Light Condensed", 32))
 left_title.grid(sticky="nw", pady=18, padx=18)
 
-organize_button = ctk.CTkButton(left, text="Organize", font=("Bahnschrift Light Condencsed", 16), command=organize_open)
+organize_button = ctk.CTkButton(left, text="Organize", font=("Bahnschrift Light Condensed", 16), command=organize_open)
 organize_button.grid(sticky="nw", pady=(36, 18), padx=18)
 
-settings_button = ctk.CTkButton(left, text="Settings", font=("Bahnschrift Light Condencsed", 16), command=settings_open)
+pictures_button = ctk.CTkButton(left, text="Pictures", font=("Bahnschrift Light Condensed", 16), command=pictures_open)
+pictures_button.grid(sticky="nw", pady=18, padx=18)
+
+settings_button = ctk.CTkButton(left, text="Settings", font=("Bahnschrift Light Condensed", 16), command=settings_open)
 settings_button.grid(sticky="nw", pady=18, padx=18)
 
-tutorial_button = ctk.CTkButton(left, text="Tutorial", font=("Bahnschrift Light Condencsed", 16), command=tutorial_open)
+tutorial_button = ctk.CTkButton(left, text="Tutorial", font=("Bahnschrift Light Condensed", 16), command=tutorial_open)
 tutorial_button.grid(sticky="nw", pady=18, padx=18)
 
 #middle
@@ -588,7 +685,16 @@ middle.grid(row = 0, column = 1)
 middle.grid_propagate(False)
 middle.grid_columnconfigure(0, weight=1)
 middle.grid_rowconfigure(10, weight=1)
-header = ctk.CTkFrame(middle, height=78, fg_color="#1f2028", corner_radius=0)
+
+#header
+header = ctk.CTkFrame(middle, height=124, fg_color="#1f2028", corner_radius=0)
+header.grid_rowconfigure(1, weight=1)
+header.grid_columnconfigure(1, weight=1)
+#folder_frame = ctk.CTkFrame(header, fg_color="#1f2029", height=32, width=324)
+#folder_frame.grid(row=3, sticky="ew", padx=30, column=0)
+folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18), width=124, height=29)
+folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
+
 #tutorial
 tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 32))
 tutorial_text1 = ctk.CTkLabel(middle, text="1. Pick a folder you want to clean\n2. Pick a function\n3. Wait for thprogram to finish\n4. Enjoy the saved time!", font=("Bahnschrift Light Condensed", 20))
@@ -613,28 +719,29 @@ water_settings.grid_rowconfigure(3, weight=1)
 water_settings.grid_propagate(False)
 water_settings.grid_columnconfigure(1, weight=1)
 rename_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
-rename_settings.grid_rowconfigure(2, weight=1)
+rename_settings.grid_rowconfigure(1, weight=1)
 rename_settings.grid_propagate(False)
-rename_settings.grid_columnconfigure(1, weight=1)
+rename_settings.grid_columnconfigure(2, weight=1)
+rename_settings.grid_columnconfigure(1, minsize=40)
 
 #Settings choice
-settings_file = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condencsed", 16), width=142)
-settings_pic = ctk.CTkButton(header, command=lambda: settings_change(1), text="Picture Modifier Settings", font=("Bahnschrift Light Condencsed", 16), width=142)
+settings_file = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
+settings_pic = ctk.CTkButton(header, command=lambda: settings_change(1), text="Picture Modifier Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
 
 #Find Settings
-settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates are: ", font=("Bahnschrift Light Condencsed", 16))
-settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
+settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates are: ", font=("Bahnschrift Light Condensed", 16))
+settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
 settings_duplicate_delete.set("Moved to a folder")
 settings_duplicate_delete_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
 settings_duplicate_delete.grid(row=0, column=1, padx=16, pady=8, sticky="e")
 
 #Sort Settings
-settings_sort_structure_text = ctk.CTkLabel(sort_settings, text="Sorted structure: ", font=("Bahnschrift Light Condencsed", 16))
-settings_sort_structure = ctk.CTkOptionMenu(sort_settings, values=["year/month/day", "year/month"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
+settings_sort_structure_text = ctk.CTkLabel(sort_settings, text="Sorted structure: ", font=("Bahnschrift Light Condensed", 16))
+settings_sort_structure = ctk.CTkOptionMenu(sort_settings, values=["year/month/day", "year/month"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
 settings_sort_structure.set("year/month/day")
 
-settings_sort_sortby_text = ctk.CTkLabel(sort_settings, text="Sort by: ", font=("Bahnschrift Light Condencsed", 16))
-settings_sort_sortby = ctk.CTkOptionMenu(sort_settings, values=["Date taken", "Date modified"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
+settings_sort_sortby_text = ctk.CTkLabel(sort_settings, text="Sort by: ", font=("Bahnschrift Light Condensed", 16))
+settings_sort_sortby = ctk.CTkOptionMenu(sort_settings, values=["Date taken", "Date modified"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
 settings_sort_sortby.set("Date taken")
 settings_sort_sortby_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
 settings_sort_sortby.grid(row=0, column=1, padx=16, pady=8, sticky="e")
@@ -642,34 +749,100 @@ settings_sort_structure_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
 settings_sort_structure.grid(row=1, column=1, padx=16, pady=8, sticky="e")
 #Rename Settings
 def rename_pattern_changed(choice):
-    if choice=="custom_name + number":
+    global check
+    if choice=="custom name + number":
+        settings_rename_renameby.grid_forget()
+        settings_rename_renameby_text.grid_forget()
         rename_settings.configure(height=96)
-        settings_rename_custom_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
-        settings_rename_custom.grid(row=1, column=1, padx=16, pady=8, sticky="e")
-    else:
-        rename_settings.configure(height=56)
-        settings_rename_custom_text.grid_forget()
+        custom_check_icon.grid(row=1, column=1, pady=8, sticky="e")
+        settings_rename_custom_text.grid(padx=(16,155), pady=8, row=1, column=0, sticky="w")
+        settings_rename_custom.grid(row=1, column=2, padx=(0,16), pady=8, sticky="e")
+        check = 0
+    elif choice=="date + number":
         settings_rename_custom.grid_forget()
-settings_rename_custom_text = ctk.CTkLabel(rename_settings, text="Custom name: ", font=("Bahnschrift Light Condencsed", 16))
-settings_rename_custom = ctk.CTkTextbox(rename_settings, height=32, width=212)
-settings_rename_custom.bind("<KeyRelease>", custom_check)
-settings_rename_pattern_text = ctk.CTkLabel(rename_settings, text="Renaming pattern: ", font=("Bahnschrift Light Condencsed", 16))
-settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["date + number", "original name + number", "custom_name + number"], font=("Bahnschrift Light Condencsed", 16), command=rename_pattern_changed, width=212, anchor="center")
-settings_rename_pattern.set("date + number")
-settings_rename_pattern_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-settings_rename_pattern.grid(row=0, column=1, padx=16, pady=8, sticky="e")
+        settings_rename_custom_text.grid_forget()
+        custom_check_icon.grid_forget()
+        custom_check_icon.grid_forget()
+        rename_settings.configure(height=96)
+        settings_rename_renameby_text.grid(padx=(16,162), pady=8, row=1, column=0, sticky="w")
+        settings_rename_renameby.grid(row=1, column=2, padx=(0,16), pady=8, sticky="e")
+        check=1
+    else:
+        settings_rename_custom_text.grid_forget()
+        custom_check_icon.grid_forget()
+        settings_rename_custom.grid_forget()
+        settings_rename_renameby_text.grid_forget()
+        settings_rename_renameby.grid_forget()
+        rename_settings.configure(height=56)
+        check=1
 
+
+def custom_check(event=None):
+    global check
+    text = settings_rename_custom.get('1.0', "end-1c")
+    if len(text) > 16:
+        print("Your custom name can't have more than 16 characters!")
+        check_text.configure(text="Your custom name can't have more than 16 characters!")
+        custom_check_icon.configure(text="!")
+        check = 0
+    elif text == "":
+        print("Your custom name can't be empty!")
+        check_text.configure(text="Your custom name can't be empty!")
+        custom_check_icon.configure(text="!")
+        check = 0
+    else:
+        for char in text.lower():
+            if char == " ":
+                check_text.configure(text=f"Your custom file name can't have space!")
+                check = 0
+                break
+            elif char not in allowed_characters:
+                print(f"Your custom file name can't have '{char}'!")
+                check_text.configure(text=f"Your custom file name can't have '{char}'!")
+                custom_check_icon.configure(text="!")
+                check = 0
+                break
+        else:
+            print(f"Your custom file name is: '{text}'")
+            check_text.configure(text=f"Your custom file name is:  ' {text} '")
+            custom_check_icon.configure(text="✓")
+            check = 1
+
+
+settings_rename_custom_text = ctk.CTkLabel(rename_settings, text="Custom name: ", font=("Bahnschrift Light Condensed", 16))
+settings_rename_custom = ctk.CTkTextbox(rename_settings, height=32, width=212)
+settings_rename_renameby_text = ctk.CTkLabel(rename_settings, text="Rename by: ", font=("Bahnschrift Light Condensed", 16))
+settings_rename_renameby = ctk.CTkOptionMenu(rename_settings, values=["Date taken", "Date modified"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
+settings_rename_custom.bind("<KeyRelease>", custom_check)
+settings_rename_pattern_text = ctk.CTkLabel(rename_settings, text="Renaming pattern: ", font=("Bahnschrift Light Condensed", 16))
+settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["original name + number", "date + number", "custom name + number"], font=("Bahnschrift Light Condensed", 16), command=rename_pattern_changed, width=212, anchor="center")
+settings_rename_pattern.set("original name + number")
+settings_rename_pattern_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
+settings_rename_pattern.grid(row=0, column=2, padx=16, pady=8, sticky="e")
+custom_check_icon = ctk.CTkLabel(rename_settings, text="!", font=("Bahnschrift Light Condensed", 26), fg_color="#1c1c24", width=32, corner_radius=8)
+
+check_display=ctk.CTkToplevel(canvas)
+check_display.overrideredirect(True)
+check_display.withdraw()
+check_text = ctk.CTkLabel(check_display, text="Your custom name can't be empty!", font=("Bahnschrift Light Condensed", 16))
+check_text.grid(padx=5, pady=2)
+
+def show_display(event):
+    check_display.geometry(f"+{event.x_root + 15}+{event.y_root + 15}")
+    check_display.deiconify()
+custom_check_icon.bind("<Motion>", show_display)
+custom_check_icon.bind("<Leave>", lambda event: check_display.withdraw())
 #Watermark Settings
 
-settings_watermark_image_text = ctk.CTkLabel(water_settings, text="Watermark image: ", font=("Bahnschrift Light Condencsed", 16))
-settings_watermark_image = ctk.CTkButton(water_settings, width=212, text="Choose an image", font=("Bahnschrift Light Condencsed", 16), command=filedialog.askopenfile)
-settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark postition: ", font=("Bahnschrift Light Condencsed", 16))
-settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"], font=("Bahnschrift Light Condencsed", 16), width=212, anchor="center")
+settings_watermark_image_text = ctk.CTkLabel(water_settings, text="Watermark image: ", font=("Bahnschrift Light Condensed", 16))
+settings_watermark_image = ctk.CTkButton(water_settings, width=212, text="Choose an image", font=("Bahnschrift Light Condensed", 16), command=filedialog.askopenfile)
+settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark postition: ", font=("Bahnschrift Light Condensed", 16))
+settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
 settings_watermark_corner.set("Top Right")
 
 watermark_size_frame = ctk.CTkFrame(water_settings, fg_color="transparent")
 watermark_size_frame.grid_columnconfigure(1, weight=1)
-settings_watermark_size_text = ctk.CTkLabel(watermark_size_frame, text="Watermark size: ", font=("Bahnschrift Light Condencsed", 16))
+settings_watermark_size_text = ctk.CTkLabel(watermark_size_frame, text="Watermark size: ", font=("Bahnschrift Light Condensed", 16))
 watermark_size_frame.grid(row=2,column=0, sticky="ew", columnspan=2)
 last_good=20
 def size_check(event=None):
@@ -726,16 +899,13 @@ def plus():
         settings_watermark_size.insert(0, str(last_good))
 
 
-set_wat_minus = ctk.CTkButton(watermark_size_subframe, text="-", command=minus, font=("Bahnschrift Light Condencsed", 16), width=49)
-set_wat_plus = ctk.CTkButton(watermark_size_subframe, text="+", command=plus, font=("Bahnschrift Light Condencsed", 16), width=49)
+set_wat_minus = ctk.CTkButton(watermark_size_subframe, text="-", command=minus, font=("Bahnschrift Light Condensed", 16), width=49)
+set_wat_plus = ctk.CTkButton(watermark_size_subframe, text="+", command=plus, font=("Bahnschrift Light Condensed", 16), width=49)
 set_wat_minus.grid(row=0,column=0, padx=(65,0), sticky="w")
 settings_watermark_size.grid(row=0, column=1, padx=5, pady=8, sticky="w")
 set_wat_plus.grid(row=0,column=2, padx=(0,16), sticky="w")
 #organize
 organize_title = ctk.CTkLabel(header, text="Organize", font=("Bahnschrift Light Condensed", 30))
-folder_frame = ctk.CTkFrame(middle, fg_color="#1f2029", height=32, width=324)
-folder_browser = ctk.CTkButton(folder_frame, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18))
-folder_chosen = ctk.CTkLabel(folder_frame, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
 actions_title = ctk.CTkLabel(middle, text="Functions", text_color="grey", font=("Bahnschrift Light Condensed", 20))
 actions_find = ctk.CTkCheckBox(middle, text="Find duplicates", font=("Bahnschrift Light Condensed", 16))
 actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift Light Condensed", 16))
@@ -775,15 +945,9 @@ canvas.mainloop()
 #TODO: Continue working on settings, then finish the restore functions in organize. Add a rename and watermark functions
 #play around with the custom name, add a checkbox to check whether its oki:>
 
-
-#WATERMARK WILL ONLY BE IN THE BOUGHT VERSION, THEREFORE IT'LL NOT BE DISPLAYED IN SETTINGS NOW.
-
-
-#!!! NOTE FOR TOMMOROW: CONTINUE WORKING ON THE FAILING GRID, THE GAP. CHATGPT COULDNT HELP WITH SHIT, GEMINI CANT SEE AND CLAUDE IS OUT OF TOKENS, I CANT FIGURE IT OUT EITHER. FINISH ITTTT
 """
 finished conditions:
 duplicates: 1/1
 sort: 2/2
-watermark: 0/3
-renaming: 0/1
+renaming: 1/1
 """
