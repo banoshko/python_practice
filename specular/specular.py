@@ -579,8 +579,8 @@ def organize_open():
     middle.grid_rowconfigure(7, weight=0)
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(sticky="ne", pady=(24,18), padx=(10,192), row=0, column=1)
-    folder_chosen.grid(sticky="ne", pady=(24,18), padx=(0,116), row=0, column=1)
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
     actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
     actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
@@ -600,18 +600,21 @@ def settings_open():
     else:
         middle_reset()
     middle.grid_columnconfigure(0, weight=1)
-    middle.grid_rowconfigure(7, weight=1)
+    middle.grid_rowconfigure(8, weight=1)
     header.grid(column=0, row=0,sticky="ew", pady=(0,16))
     settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
     settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
-    folder_browser.grid(sticky="ne", pady=(24,18), padx=(10,192), row=0, column=1)
-    folder_chosen.grid(sticky="ne", pady=(24,18), padx=(0,116), row=0, column=1)
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
     #set picture options oki?
 
-    find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
-    sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
-    rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
+    find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
+    find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+    sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
+    sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
+    rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
+    rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
     currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
 
 def settings_change(option=0):
@@ -623,7 +626,8 @@ def settings_change(option=0):
     settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
     settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
-
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
     if option == 1:
         water_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
     else:
@@ -640,8 +644,8 @@ def tutorial_open():
         middle_reset()
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(sticky="ne", pady=(24,18), padx=(10,192), row=0, column=1)
-    folder_chosen.grid(sticky="ne", pady=(24,18), padx=(0,116), row=0, column=1)
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
 #tk
 ctk.set_appearance_mode("dark")
@@ -688,8 +692,9 @@ middle.grid_rowconfigure(10, weight=1)
 
 #header
 header = ctk.CTkFrame(middle, height=124, fg_color="#1f2028", corner_radius=0)
-header.grid_rowconfigure(1, weight=1)
+header.grid_rowconfigure(0, weight=1)
 header.grid_columnconfigure(1, weight=1)
+header.grid_columnconfigure(0, minsize=150)
 #folder_frame = ctk.CTkFrame(header, fg_color="#1f2029", height=32, width=324)
 #folder_frame.grid(row=3, sticky="ew", padx=30, column=0)
 folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18), width=124, height=29)
@@ -723,6 +728,10 @@ rename_settings.grid_rowconfigure(1, weight=1)
 rename_settings.grid_propagate(False)
 rename_settings.grid_columnconfigure(2, weight=1)
 rename_settings.grid_columnconfigure(1, minsize=40)
+
+find_explain = ctk.CTkLabel(middle, text_color="grey", text="Finding duplicate files", font=("Bahnschrift Light Condensed", 13))
+sort_explain = ctk.CTkLabel(middle, text_color="grey", text="Sorting files", font=("Bahnschrift Light Condensed", 13))
+rename_explain = ctk.CTkLabel(middle, text_color="grey", text="Renaming ifle", font=("Bahnschrift Light Condensed", 13))
 
 #Settings choice
 settings_file = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
@@ -944,10 +953,4 @@ canvas.mainloop()
 
 #TODO: Continue working on settings, then finish the restore functions in organize. Add a rename and watermark functions
 #play around with the custom name, add a checkbox to check whether its oki:>
-
-"""
-finished conditions:
-duplicates: 1/1
-sort: 2/2
-renaming: 1/1
-"""
+#When the chosen folders name is too long, the folder_chosen grid glitches and goes out of frame...
