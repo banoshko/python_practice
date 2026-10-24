@@ -8,12 +8,13 @@ import hashlib
 import os
 import sys
 import customtkinter as ctk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ExifTags
 import json
 import threading
+import logging
 import queue
-import send2trash
+from send2trash import send2trash
 import ctypes
 
 #Developer settings
@@ -25,9 +26,11 @@ suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)", "(16)", "(17)", "(18)", "(19)", "(20)", "- Copy"
 ]
 q = queue.Queue()
+cfg = {}
 check = 1
 path = Path(os.getenv("APPDATA")) / "Specorde"
 path.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(filename=path / "specorde.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 memory = path / "memory.json"
 
 try:
@@ -57,15 +60,53 @@ exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif", ".cr3", ".nef", ".arw", ".dng",
 #Script itself
 def start_execute(task):
     threading.Thread(target=task, daemon=True).start()
+
 def run_execute():
+    global cfg
+    if "target_folder" not in globals():
+        q.put(("status", "You must pick a folder."))
+        q.put(("status_reset", None))
+        return
+    if not (actions_find.get() or actions_sort.get() or actions_rename.get()):
+        q.put(("status", "Tick at least one function."))
+        q.put(("status_reset", None))
+        return
+    if actions_rename.get() and settings_rename_pattern.get() == "custom name + number" and check == 0:
+        messagebox.showwarning("Specorde", "Your custom name is not valid. Check it in Settings.")
+        return
+    if not target_folder.is_dir():
+        messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again.")
+        return
+    count = sum(1 for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f))
+    message = f"This will change files in '{target_folder.name}' ({count} files)."
+    if actions_find.get() and settings_duplicate_delete.get() == "Deleted":
+        message += "\n\nDuplicates will be sent to the Recycle Bin. On USB or network drives they may be deleted permanently."
+    if not messagebox.askyesno("Specorde", message + "\n\nContinue?"):
+        return
+    cfg = {
+        "find": actions_find.get(),
+        "water": actions_water.get(),
+        "sort": actions_sort.get(),
+        "rename": actions_rename.get(),
+        "sortby": settings_sort_sortby.get(),
+        "structure": settings_sort_structure.get(),
+        "duplicate_mode": settings_duplicate_delete.get(),
+        "pattern": settings_rename_pattern.get(),
+        "renameby": settings_rename_renameby.get(),
+        "custom": settings_rename_custom.get("1.0", "end-1c"),
+    }
     q.put(("lock", None))
     start_execute(execute)
-
+reset_job = None
 def check_messages():
+    global reset_job
     try:
         while True:
             kind, value = q.get_nowait()
             if kind == "status":
+                if reset_job is not None:
+                    canvas.after_cancel(reset_job)
+                    reset_job = None
                 status.configure(text=value)
             elif kind == "bar_text":
                 bar_text.configure(text=value)
@@ -84,25 +125,42 @@ def check_messages():
             elif kind == "bar_text_hide":
                 bar_text.grid_forget()
             elif kind == "status_reset":
-                status.after(1700, lambda: status.configure(text="Sitting..."))
+                if reset_job is not None:
+                    canvas.after_cancel(reset_job)
+                reset_job = canvas.after(1700, lambda: status.configure(text="Sitting..."))
             elif kind == "lock":
                 execute_button.configure(fg_color="#173348", state="disabled")
                 folder_browser.configure(fg_color="#173348", state="disabled")
             elif kind == "unlock":
                 execute_button.configure(fg_color="#1f6aa5", state="normal")
                 folder_browser.configure(fg_color="#1f6aa5", state="normal")
-            canvas.update_idletasks()
     except queue.Empty:
         pass
     canvas.after(20, check_messages)
+
+def parse_exif_date(text):
+    try:
+        return datetime.strptime(text, "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+def safe_rename(item, destination):
+    try:
+        item.rename(destination)
+    except OSError:
+        logging.exception("Could not move or rename %s", item.name)
 
 def get_exif(path):
     try:
         with Image.open(path) as img:
             exif = img.getexif()
             if exif:
-                date_str = exif.get(36867) or exif.get(306)
-                
+                date_str = None
+                try:
+                    date_str = exif.get_ifd(0x8769).get(36867)
+                except Exception:
+                    pass
+                date_str = date_str or exif.get(36867) or exif.get(306)
                 if not date_str:
                     try:
                         exif_ifd = exif.get_ifd(0x8769)
@@ -122,20 +180,22 @@ def sort():
     global status
     global bar
     try:
-
+        done = 0
         q.put(("bar_set", 0))
-        for item in target_folder.iterdir():
+        for item in list(target_folder.iterdir()):
             q.put(("bar_show", None))
             q.put(("bar_text_show", None))
 
             try:
-                if item.is_file() or item.is_dir() and item.name not in ["duplicates", "sorted"]:
-                    if settings_sort_sortby.get() == "Date modified":
+                if item.is_file() and not is_protected_item(item):
+                    done = done + item.stat().st_size / (1024*1024*1024)
+
+                    if cfg["sortby"] == "Date modified":
                         file_time = datetime.fromtimestamp(item.stat().st_mtime)
                         year = str(file_time.year)
                         month = month_dict[file_time.month]
                         day = str(file_time.day)
-                    elif settings_sort_sortby.get() == "Date taken":
+                    elif cfg["sortby"] == "Date taken":
 
                         if item.suffix.lower() not in exif_suffix:
                             file_time = datetime.fromtimestamp(item.stat().st_mtime)
@@ -145,8 +205,8 @@ def sort():
                             print(f"{item.name} has an unsupported suffix. sorting by date modified")
                         else:
                             exif_string = get_exif(item)
-                            if exif_string:
-                                photo_date = datetime.strptime(exif_string, "%Y:%m:%d %H:%M:%S")
+                            photo_date = parse_exif_date(exif_string) if exif_string else None
+                            if photo_date:
                                 year = str(photo_date.year)
                                 month = month_dict[photo_date.month]
                                 day = str(photo_date.day)
@@ -165,7 +225,7 @@ def sort():
                     month_dir.mkdir(exist_ok=True)
                     years_used.append(year)
 
-                    if settings_sort_structure.get() == "year/month":
+                    if cfg["structure"] == "year/month":
                         destination = Path(month_dir/item.name)
 
                         if destination.exists():
@@ -173,9 +233,9 @@ def sort():
                             while destination.exists():
                                 destination = Path(month_dir/f"{item.stem}_{counter}{item.suffix}")
                                 counter += 1
-                        item.rename(destination)
+                        safe_rename(item, destination)
 
-                    elif settings_sort_structure.get() == "year/month/day":
+                    elif cfg["structure"] == "year/month/day":
                         day_dir = month_dir / day
                         day_dir.mkdir(exist_ok=True)
                         destination = Path(day_dir/item.name)
@@ -185,9 +245,10 @@ def sort():
                             while destination.exists():
                                 destination = Path(day_dir/f"{item.stem}_{counter}{item.suffix}")
                                 counter += 1
-                        item.rename(destination)
+                        safe_rename(item, destination)
+
                     try:
-                        percent = sum(f.stat().st_size for f in sorted_dir.rglob('*') if f.is_file())/(1024*1024*1024) / folder_size * 100
+                        percent = done / folder_size * 100
                         if percent > 80:
                             q.put(("status", "Almost there!"))
                         else:
@@ -197,9 +258,8 @@ def sort():
 
                     except ZeroDivisionError:
                         ()
-            except PermissionError:
-                print(f"Not permitted to move {item.name}.")
-
+            except Exception:
+                logging.exception("Could not sort %s", item.name)
 
         q.put(("bar_text", "100%"))
         q.put(("status", "Files sorted!"))
@@ -217,7 +277,7 @@ def sort():
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     q.put(("status_reset", None))
-    
+
 def restore_sort():
     global bar_text
     global status
@@ -258,6 +318,20 @@ def restore_sort():
         print("Not allowed to move this file.")
     q.put(("status_reset", None))
 
+def is_copy(file):
+    return any(suf in file.stem for suf in suffix)
+
+def remove_duplicate(file, mode):
+    if mode == "Moved to a folder":
+        destination = duplicates / file.name
+        counter = 1
+        while destination.exists():
+            destination = duplicates / f"{file.stem}_{counter}{file.suffix}"
+            counter += 1
+        file.rename(destination)
+    elif mode == "Deleted":
+        send2trash(str(file))
+
 def duplicate_finder():
     global bar_text
     global status
@@ -266,54 +340,45 @@ def duplicate_finder():
         changed =0
         seen = {}
         size = 0
+        mode = cfg["duplicate_mode"]
         q.put(("bar_set", 0))
-        for item in target_folder.iterdir():
+        for item in list(target_folder.iterdir()):
             q.put(("bar_show", None))
             q.put(("bar_text_show", None))
-            if item.is_file():
-                hash = get_hash(item)
+            if item.is_file() and not is_protected_item(item):
+                try:
+                    if item.stat().st_size == 0:
+                        continue
+                    hash = get_hash(item)
+                except OSError:
+                    logging.exception("Could not read %s", item.name)
+                    continue
                 try:
                     size = size + item.stat().st_size / (1024*1024*1024)
                 except FileNotFoundError:
                     print(f"File {item.name} not found")
 
                 if hash in seen:
-                    if settings_duplicate_delete.get() == "Moved to a folder":
+                    if mode == "Moved to a folder":
                         duplicates.mkdir(exist_ok=True)
-                    if any(suf in seen[hash].stem for suf in suffix):
-                        if any(suf in item.stem for suf in suffix):
-                            if settings_duplicate_delete.get() == "Moved to a folder":
-                                destination = Path(duplicates/item.name)
-
-                                if destination.exists():
-                                    counter = 1
-                                    while destination.exists():
-                                        destination = Path(duplicates/f"{item.stem}_{counter}{item.suffix}")
-                                        counter += 1
-                                item.rename(destination)
-                            elif settings_duplicate_delete.get() == "Deleted":
-                                send2trash(str(item))
-                            changed = 1
+                    try:
+                        if is_copy(seen[hash]) and not is_copy(item):
+                            remove_duplicate(seen[hash], mode)
+                            seen[hash] = item
                         else:
-                            if settings_duplicate_delete.get() == "Moved to a folder":
-                                try:
-                                    seen[hash].rename(duplicates/seen[hash].name)
-                                except PermissionError:
-                                    print(f"Permission error with {seen[hash]}")
-                            elif settings_duplicate_delete.get() == "Deleted":
-                                send2trash(str(seen[hash]))
-                            changed = 1
-                            seen[hash] = Path(item)
+                            remove_duplicate(item, mode)
+                        changed = 1
+                    except Exception:
+                        logging.exception("Could not remove duplicate %s", item.name)
                 else:
-                    seen[hash] = Path(item)
+                    seen[hash] = item
 
                 try:
                     percent = size / folder_size * 100
-                    print(item.name, percent)
                     if percent > 80:
                         q.put(("status", "Almost there!"))
                     else:
-                        q.put(("status", "Finding all the duplicates"))
+                        q.put(("status", "Finding duplicates"))
                     q.put(("bar_text", f"{percent :.2f}%"))
                     q.put(("bar_set", percent/100))
                 except ZeroDivisionError:
@@ -323,7 +388,7 @@ def duplicate_finder():
                     size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
                 except FileNotFoundError:
                     print(f"File {item.name} not found")
-        if settings_duplicate_delete.get() == "Moved to a folder":
+        if mode == "Moved to a folder":
             if not duplicates.exists():
                 q.put(("bar_text", "100%"))
                 q.put(("status", "No duplicates found!"))
@@ -337,13 +402,13 @@ def duplicate_finder():
                 elif changed == 1:
                     q.put(("bar_text", "100%"))
                     q.put(("status", "All duplicates found!"))
-        elif settings_duplicate_delete.get() == "Deleted":
+        elif mode == "Deleted":
             if changed == 0:
                 q.put(("bar_text", "100%"))
                 q.put(("status", "No duplicates found!"))
             elif changed == 1:
                 q.put(("bar_text", "100%"))
-                q.put(("status", "All duplicates terminated!"))
+                q.put(("status", "Duplicates removed!"))
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     except NameError:
@@ -366,7 +431,7 @@ def restore_duplicate():
     try:
         if target_folder.name == "duplicates":
             q.put(("status", "Restoring duplicates..."))
-            for item in target_folder.iterdir():
+            for item in list(target_folder.iterdir()):
                 item.rename(target_folder.parent/item.name)
             target_folder.rmdir()
             status.after(500)
@@ -401,21 +466,21 @@ def rename():
     global bar_text
     global status
     if check == 0:
-        q.put(("status", "Your custom name is not \nvalid."))
+        q.put(("status", "Your custom name is not valid."))
         q.put(("status_reset", None))
         return
     q.put(("bar_set", 0))
     q.put(("bar_show", None))
     q.put(("bar_text_show", None))
     size = 0
-    choice = settings_rename_pattern.get()
-    renameby = settings_rename_renameby.get()
-    custom = settings_rename_custom.get("1.0", "end-1c")
+    choice = cfg["pattern"]
+    renameby = cfg["renameby"]
+    custom = cfg["custom"]
     number = 0
     try:
-        count = len([f for f in target_folder.iterdir() if f.is_file()])
+        files = [f for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f)]
+        count = len(files)
         width = len(str(count))
-        files = [f for f in target_folder.iterdir() if f.is_file()]
         for item in files:
             counter = 0
             if item.is_file():
@@ -449,7 +514,7 @@ def rename():
                             while destination.exists():
                                 counter += 1
                                 destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}_{counter}{item.suffix}")
-                        item.rename(destination)
+                        safe_rename(item, destination)
 
                     elif renameby == "Date taken":
                         if item.suffix.lower() not in exif_suffix:
@@ -460,8 +525,8 @@ def rename():
                             print(f"{item.name} has an unsupported suffix. renaming by date modified")
                         else:
                             exif_string = get_exif(item)
-                            if exif_string:
-                                photo_date = datetime.strptime(exif_string, "%Y:%m:%d %H:%M:%S")
+                            photo_date = parse_exif_date(exif_string) if exif_string else None
+                            if photo_date:
                                 year = str(photo_date.year)
                                 month = str(photo_date.month).zfill(2)
                                 day = str(photo_date.day).zfill(2)
@@ -478,14 +543,14 @@ def rename():
                             while destination.exists():
                                 counter += 1
                                 destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}_{counter}{item.suffix}")
-                        item.rename(destination)
+                        safe_rename(item, destination)
                 elif choice == "original name + number":
                     destination = Path(f"{target_folder}/{item.stem}_{number_text}{item.suffix}")
                     if destination.exists():
                         while destination.exists():
                             counter += 1
                             destination = Path(f"{target_folder}/{item.stem}_{number_text}_{counter}{item.suffix}")
-                    item.rename(destination)
+                    safe_rename(item, destination)
 
                 elif choice == "custom name + number":
                     destination = Path(f"{target_folder}/{custom}_{number_text}{item.suffix}")
@@ -493,7 +558,7 @@ def rename():
                         while destination.exists():
                             counter += 1
                             destination = Path(f"{target_folder}/{custom}_{number_text}_{counter}{item.suffix}")
-                    item.rename(destination)
+                    safe_rename(item, destination)
                 
             else:
                 try:
@@ -517,6 +582,57 @@ def rename():
         q.put(("bar_destroy", None))
     q.put(("status_reset", None))
 
+PROTECTED_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", "ntuser.dat", "pagefile.sys", "hiberfil.sys", "swapfile.sys"}
+PROTECTED_SUFFIXES = {".sys", ".dll", ".drv", ".ini", ".exe", ".msi", ".lnk", ".bat", ".cmd", ".reg"}
+
+def is_protected_item(item):
+    name = item.name.lower()
+    if name in PROTECTED_NAMES or item.suffix.lower() in PROTECTED_SUFFIXES:
+        return True
+    if name.startswith(".") or name.startswith("$"):
+        return True
+    try:
+        if item.is_symlink():
+            return True
+        attributes = item.lstat().st_file_attributes
+        if attributes & (0x2 | 0x4):
+            return True
+    except (AttributeError, OSError):
+        pass
+    return False
+
+def is_dangerous(folder):
+    folder = folder.resolve()
+    home = Path.home().resolve()
+    if folder == Path(folder.anchor) or folder == home or folder == home.parent:
+        return True
+    for name in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "APPDATA", "LOCALAPPDATA"):
+        value = os.environ.get(name)
+        if value:
+            blocked = Path(value).resolve()
+            if folder == blocked or blocked in folder.parents:
+                return True
+    for part in folder.parts:
+        if part.lower() in ("appdata", "$recycle.bin", "system volume information"):
+            return True
+    return False
+
+def measure_folder(folder):
+    global folder_size
+    total = 0
+    try:
+        for f in folder.rglob("*"):
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    except Exception:
+        logging.exception("Could not measure %s", folder.name)
+    folder_size = total / (1024*1024*1024)
+    q.put(("status", "Folder ready!"))
+    q.put(("status_reset", None))
+    q.put(("unlock", None))
+
 def pick_folder():
     global target_folder
     global folder_size
@@ -524,19 +640,30 @@ def pick_folder():
     global sorted_dir
 
     chosen = filedialog.askdirectory()
+    if not chosen:
+        return
+    if is_dangerous(Path(chosen)):
+        messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder.")
+        return
+    target_folder = Path(chosen)
+    folder_browser.configure(text="Choose a different folder")
 
-    while True:
-        if chosen:
-            target_folder = Path(chosen)
-            folder_browser.configure(text = "Choose a different folder")
-            folder_chosen.configure(text = f"Folder chosen: '{target_folder.name}'")
-            break
-        else:
-            chosen = filedialog.askdirectory()
+    label_font = ctk.CTkFont(family="Bahnschrift Light Condensed", size=14)
+    max_width = 165
+    shown_name = target_folder.name
+    shown_text = f"Folder chosen: '{shown_name}'"
+    if label_font.measure(shown_text) > max_width:
+        while shown_name and label_font.measure(f"Folder chosen: '{shown_name}...'") > max_width:
+            shown_name = shown_name[:-1]
+        shown_text = f"Folder chosen: '{shown_name.rstrip()}...'"
+    folder_chosen.configure(text=shown_text)
 
-    folder_size = sum(f.stat().st_size for f in target_folder.rglob("*"))/(1024*1024*1024)
     sorted_dir = Path(target_folder/"sorted")
     duplicates = Path(target_folder/"duplicates")
+    folder_size = 0
+    q.put(("lock", None))
+    q.put(("status", "Reading folder..."))
+    threading.Thread(target=measure_folder, args=(target_folder,), daemon=True).start()
 
 allowed_characters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "_", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
 def get_hash(filepath = Path):
@@ -548,22 +675,25 @@ def get_hash(filepath = Path):
 
 def execute():
     try:
-        if actions_find.get():
+        if cfg["find"]:
             print("Finding duplicates...")
             duplicate_finder()
-        if actions_water.get():
+        if cfg["water"]:
             print("Adding watermarks...")
             watermark()
-
-        if actions_rename.get():
+        if cfg["rename"]:
             print("Renaming files...")
             rename()
-        if actions_sort.get():
+        if cfg["sort"]:
             print("Sorting...")
             sort()
         q.put(("unlock", None))
     except Exception:
-        print("Error trying to execute.")
+        logging.exception("Error trying to execute")
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+        q.put(("status", "Something went wrong. See log."))
+        q.put(("status_reset", None))
         q.put(("unlock", None))
     
 def middle_reset():
@@ -594,7 +724,7 @@ def organize_open():
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,8))
     actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
     actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
@@ -606,50 +736,31 @@ def organize_open():
 def pictures_open():
     ()
 
-def settings_open():
-    global middle
+def settings_open(option=0):
     global currently_open
-    if currently_open == 1:
-        ()
-    else:
-        middle_reset()
+    middle_reset()                     # always reset, never skip
     middle.grid_columnconfigure(0, weight=1)
     middle.grid_rowconfigure(8, weight=1)
-    header.grid(column=0, row=0,sticky="ew", pady=(0,16))
+    header.grid(column=0, row=0, sticky="ew", pady=(0,16))
     settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
     settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
-    #set picture options oki?
-
-    find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
-    find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
-    sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
-    sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
-    rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
-    rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
-    currently_open = 1 #(0 for organize, 1 for settings, 2 for tutorial)
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,8))
+    if option == 1:
+        water_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
+        water_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+    else:
+        find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
+        find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+        sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
+        sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
+        rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
+        rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
+    currently_open = 1
 
 def settings_change(option=0):
-    global middle
-    middle_reset()
-    middle.grid_columnconfigure(0, weight=1)
-    middle.grid_rowconfigure(7, weight=1)
-    header.grid(column=0, row=0,sticky="ew", pady=(0,16))
-    settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
-    settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
-    settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
-    if option == 1:
-        water_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
-    else:
-        find_settings.grid(row=3, column=0, padx=20, pady=12, sticky="ew")
-        sort_settings.grid(row=4, column=0, padx=20, pady=12, sticky="ew")
-        rename_settings.grid(row=6, column=0, padx=20, pady=12, sticky="ew")
-
- 
+    settings_open(option)
 
 def tutorial_open():
     global middle
@@ -662,7 +773,7 @@ def tutorial_open():
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,0))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,8))
     tutorial_frame.grid(row=1, column=0, sticky="nw", padx=18)
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
  
@@ -679,13 +790,18 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("specorde")
 canvas = ctk.CTk()
+def log_tk_error(exc, val, tb):
+    logging.error("Unhandled error", exc_info=(exc, val, tb))
+canvas.report_callback_exception = log_tk_error
 canvas.title("Specorde")
 canvas.geometry("1024x576")
 canvas.resizable(width=False, height=False)
-logo = ImageTk.PhotoImage(Image.open(str(resource_path("specorde_logo.ico"))))
-canvas.after(500, lambda: canvas.iconbitmap(str(resource_path("specorde_logo.ico"))))
-canvas.after(600, lambda: canvas.iconphoto(True, logo))
-
+try:
+    logo = ImageTk.PhotoImage(Image.open(str(resource_path("specorde_logo.ico"))))
+    canvas.after(500, lambda: canvas.iconbitmap(str(resource_path("specorde_logo.ico"))))
+    canvas.after(600, lambda: canvas.iconphoto(True, logo))
+except Exception:
+    logging.exception("Icon failed to load")
 check_messages()
 
 #left
@@ -723,7 +839,7 @@ header.grid_rowconfigure(0, weight=1)
 header.grid_columnconfigure(1, weight=1)
 header.grid_columnconfigure(0, minsize=150)
 folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18), width=124, height=29)
-folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14))
+folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14), anchor="w")
 
 #tutorial
 tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 30))
@@ -736,11 +852,11 @@ tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick wha
 tutorial_functions_title = ctk.CTkLabel(tutorial_frame, text="Functions", font=("Bahnschrift Light Condensed", 21))
  
 tutorial_find_title = ctk.CTkLabel(tutorial_frame, text="Find duplicates", font=("Bahnschrift Light Condensed", 18))
-tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or deleted for good.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or sent to the recycle bin.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_sort_title = ctk.CTkLabel(tutorial_frame, text="Sort files", font=("Bahnschrift Light Condensed", 18))
 tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted' folder by date. Choose date taken or date modified, and year/month or year/month/day.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_rename_title = ctk.CTkLabel(tutorial_frame, text="Rename files", font=("Bahnschrift Light Condensed", 18))
-tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (16 characters, no spaces).", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores).", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
  
 tutorial_howto_title = ctk.CTkLabel(tutorial_frame, text="How to use it", font=("Bahnschrift Light Condensed", 21))
 tutorial_howto_text = ctk.CTkLabel(tutorial_frame, text="1.  Press 'Choose a folder' and pick the folder to tidy.\n2.  Adjust the functions in 'Settings' (optional).\n3.  Tick what you want in 'Organize'.\n4.  Press 'Execute' and wait for the status to finish.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
@@ -759,19 +875,19 @@ tutorial_howto_text.grid(row=10, column=0, padx=(14,6), sticky="w")
 
 #settings
 settings_label = ctk.CTkLabel(header, text="Settings", font=("Bahnschrift Light Condensed", 32))
-find_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
+find_settings = ctk.CTkFrame(middle, width=364, height=44, fg_color="#1f2029")
 find_settings.grid_rowconfigure(2, weight=1)
 find_settings.grid_propagate(False)
 find_settings.grid_columnconfigure(1, weight=1)
-sort_settings = ctk.CTkFrame(middle, width=364, height=96, fg_color="#1f2029")
+sort_settings = ctk.CTkFrame(middle, width=364, height=88, fg_color="#1f2029")
 sort_settings.grid_rowconfigure(2, weight=1)
 sort_settings.grid_propagate(False)
 sort_settings.grid_columnconfigure(1, weight=1)
-water_settings = ctk.CTkFrame(middle, width=364, height=136, fg_color="#1f2029")
+water_settings = ctk.CTkFrame(middle, width=364, height=64, fg_color="#1f2029")
 water_settings.grid_rowconfigure(3, weight=1)
 water_settings.grid_propagate(False)
 water_settings.grid_columnconfigure(1, weight=1)
-rename_settings = ctk.CTkFrame(middle, width=364, height=56, fg_color="#1f2029")
+rename_settings = ctk.CTkFrame(middle, width=364, height=44, fg_color="#1f2029")
 rename_settings.grid_rowconfigure(1, weight=1)
 rename_settings.grid_propagate(False)
 rename_settings.grid_columnconfigure(2, weight=1)
@@ -779,7 +895,8 @@ rename_settings.grid_columnconfigure(1, minsize=40)
 
 find_explain = ctk.CTkLabel(middle, text_color="grey", text="Finding duplicate files", font=("Bahnschrift Light Condensed", 13))
 sort_explain = ctk.CTkLabel(middle, text_color="grey", text="Sorting files", font=("Bahnschrift Light Condensed", 13))
-rename_explain = ctk.CTkLabel(middle, text_color="grey", text="Renaming ifle", font=("Bahnschrift Light Condensed", 13))
+rename_explain = ctk.CTkLabel(middle, text_color="grey", text="Renaming files", font=("Bahnschrift Light Condensed", 13))
+water_explain = ctk.CTkLabel(middle, text_color="grey", text="Adding watermarks", font=("Bahnschrift Light Condensed", 13))
 
 #Settings choice
 settings_file = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
@@ -814,7 +931,7 @@ def rename_pattern_changed(choice):
         custom_check_icon.grid(row=1, column=1, pady=8, sticky="e")
         settings_rename_custom_text.grid(padx=(16,155), pady=8, row=1, column=0, sticky="w")
         settings_rename_custom.grid(row=1, column=2, padx=(0,16), pady=8, sticky="e")
-        check = 0
+        custom_check()
     elif choice=="date + number":
         settings_rename_custom.grid_forget()
         settings_rename_custom_text.grid_forget()
@@ -830,7 +947,7 @@ def rename_pattern_changed(choice):
         settings_rename_custom.grid_forget()
         settings_rename_renameby_text.grid_forget()
         settings_rename_renameby.grid_forget()
-        rename_settings.configure(height=56)
+        rename_settings.configure(height=44)
         check=1
 
 
@@ -850,18 +967,19 @@ def custom_check(event=None):
     else:
         for char in text.lower():
             if char == " ":
-                check_text.configure(text=f"Your custom file name can't have space!")
+                check_text.configure(text=f"Your custom name can't have a space!")
+                custom_check_icon.configure(text="!")
                 check = 0
                 break
             elif char not in allowed_characters:
-                print(f"Your custom file name can't have '{char}'!")
-                check_text.configure(text=f"Your custom file name can't have '{char}'!")
+                print(f"Your custom name can't have '{char}'!")
+                check_text.configure(text=f"Your custom name can't have '{char}'!")
                 custom_check_icon.configure(text="!")
                 check = 0
                 break
         else:
-            print(f"Your custom file name is: '{text}'")
-            check_text.configure(text=f"Your custom file name is:  ' {text} '")
+            print(f"Your custom name is: '{text}'")
+            check_text.configure(text=f"Your custom name is:  ' {text} '")
             custom_check_icon.configure(text="✓")
             check = 1
 
@@ -893,7 +1011,7 @@ custom_check_icon.bind("<Leave>", lambda event: check_display.withdraw())
 
 settings_watermark_image_text = ctk.CTkLabel(water_settings, text="Watermark image: ", font=("Bahnschrift Light Condensed", 16))
 settings_watermark_image = ctk.CTkButton(water_settings, width=212, text="Choose an image", font=("Bahnschrift Light Condensed", 16), command=filedialog.askopenfile)
-settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark postition: ", font=("Bahnschrift Light Condensed", 16))
+settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark position: ", font=("Bahnschrift Light Condensed", 16))
 settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
 settings_watermark_corner.set("Top Right")
 
@@ -992,24 +1110,26 @@ right.grid_rowconfigure(10, weight=1)
 right_title = ctk.CTkLabel(right, text="Activity", font=("Bahnschrift Light Condensed", 30))
 right_title.grid(sticky="nw", pady=18, padx=18)
 
-status = ctk.CTkLabel(right, text="Sitting...", font=("Bahnschrift Light Condensed", 24), text_color="grey")
+status = ctk.CTkLabel(right, text="Sitting...", font=("Bahnschrift Light Condensed", 22), text_color="grey", fg_color="#1f2029", width=230, height=34, anchor="w")
 status.grid(row=2, sticky="nw", padx=20)
 bar = ctk.CTkProgressBar(right)
 q.put(("bar_hide", None))
 bar_text = ctk.CTkLabel(right, text="")
 q.put(("bar_text_hide", None))
 
+def open_log():
+    try:
+        os.startfile(path)
+    except Exception:
+        logging.exception("Could not open log folder")
 
 #version
 version_frame = ctk.CTkFrame(right, fg_color="transparent")
-version_label = ctk.CTkLabel(version_frame, text="v1.0 (first demo)", text_color="grey", font=("Bahnschrift Light Condensed", 10))
+version_label = ctk.CTkLabel(version_frame, text="v0.1 beta", text_color="grey", font=("Bahnschrift Light Condensed", 10))
 version_disclaimer = ctk.CTkLabel(version_frame, text="|  Not the finished version", text_color="grey", font=("Bahnschrift Light Condensed", 10))
+log_button = ctk.CTkButton(version_frame, text="Open log", font=("Bahnschrift Light Condensed", 12), command=open_log, width=52, height=24)
 version_frame.grid(row=11, column=0, sticky="sw", padx=14, pady=(0,10))
 version_label.grid(row=0, column=0, sticky="w")
 version_disclaimer.grid(row=0, column=1, padx=(6,0), sticky="w")
- 
+log_button.grid(row=0, column=2, padx=(64,18), sticky="e")
 canvas.mainloop()
-
-#TODO: Continue working on settings, then finish the restore functions in organize. Add a rename and watermark functions
-#play around with the custom name, add a checkbox to check whether its oki:>
-#When the chosen folders name is too long, the folder_chosen grid glitches and goes out of frame...
