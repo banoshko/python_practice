@@ -31,20 +31,21 @@ check = 1
 path = Path(os.getenv("APPDATA")) / "Specorde"
 path.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=path / "specorde.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.info("Specorde started")
 memory = path / "memory.json"
 
 try:
     with open(memory, "r") as f:
         tutorial_seen = json.load(f)
 except FileNotFoundError:
-    print("File not found.")
+    logging.exception("File not found")
     memory = Path(memory)
     memory.touch(exist_ok=True)
     with open(memory, "w") as f:
         json.dump(0, f)
     tutorial_seen = 0
 except json.JSONDecodeError:
-    print("File empty")
+    logging.warning("memory.json was empty, starting fresh")
     memory = Path(memory)
     memory.touch(exist_ok=True)
     with open(memory, "w") as f:
@@ -216,7 +217,7 @@ def sort():
                                 year = str(file_time.year)
                                 month = month_dict[file_time.month]
                                 day = str(file_time.day)
-                                print(f"0 - Couldn't sort item {item.name} by date taken, sorted by date modified instead.")
+                                logging.warning(f"No date taken for {item.name}, sorted by date modified instead")
 
                     sorted_dir.mkdir(exist_ok=True)
                     year_dir = sorted_dir / year
@@ -265,7 +266,7 @@ def sort():
         q.put(("status", "Files sorted!"))
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
-        print("Files sorted.")
+        logging.info("Files sorted.")
     except NameError:
         print("You must pick a folder.")
         q.put(("bar_text_destroy", None))
@@ -273,7 +274,7 @@ def sort():
         q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
     except FileNotFoundError:
-        print("File not found.")
+        logging.exception("File not found")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     q.put(("status_reset", None))
@@ -313,9 +314,9 @@ def restore_sort():
         print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
     except FileNotFoundError:
-        print("File not found.")
+        logging.exception("File not found")
     except PermissionError:
-        print("Not allowed to move this file.")
+        logging.exception("Restore: permission denied")
     q.put(("status_reset", None))
 
 def is_copy(file):
@@ -356,7 +357,7 @@ def duplicate_finder():
                 try:
                     size = size + item.stat().st_size / (1024*1024*1024)
                 except FileNotFoundError:
-                    print(f"File {item.name} not found")
+                    logging.warning(f"File {item.name} not found")
 
                 if hash in seen:
                     if mode == "Moved to a folder":
@@ -387,7 +388,7 @@ def duplicate_finder():
                 try:
                     size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
                 except FileNotFoundError:
-                    print(f"File {item.name} not found")
+                    logging.warning(f"File {item.name} not found")
         if mode == "Moved to a folder":
             if not duplicates.exists():
                 q.put(("bar_text", "100%"))
@@ -417,11 +418,11 @@ def duplicate_finder():
         q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
     except FileNotFoundError:
-        print("File Not Found Error")
+        logging.exception("Duplicate finder: file not found")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     except PermissionError:
-        print("Permission Error Error")
+        logging.exception("Duplicate finder: permission denied")
     q.put(("status_reset", None))
 
 def restore_duplicate():
@@ -452,7 +453,7 @@ def restore_duplicate():
         print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
     except FileNotFoundError:
-        print("File not found.")
+        logging.exception("File not found")
     q.put(("status_reset", None))
 def watermark():
     try:
@@ -487,7 +488,7 @@ def rename():
                 try:
                     size = size + item.stat().st_size / (1024*1024*1024)
                 except FileNotFoundError:
-                    print(f"File {item.name} not found")
+                    logging.warning(f"File {item.name} not found")
                 number += 1
                 number_text = str(number).zfill(width)
 
@@ -536,7 +537,7 @@ def rename():
                                 year = str(file_time.year)
                                 month = str(file_time.month).zfill(2)
                                 day = str(file_time.day).zfill(2)
-                                print(f"0 - Couldn't rename item {item.name} by date taken, renaming by date modified instead.")
+                                logging.warning(f"No date taken for {item.name}, renamed by date modified instead")
 
                         destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}{item.suffix}")
                         if destination.exists():
@@ -564,12 +565,12 @@ def rename():
                 try:
                     size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
                 except FileNotFoundError:
-                    print(f"File {item.name} not found")
+                    logging.warning(f"File {item.name} not found")
         q.put(("bar_text", "100%"))
         q.put(("status", "Files renamed!"))
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
-        print("Files Renamed.")
+        logging.info("Files renamed.")
     except NameError:
         print("You must pick a folder.")
         q.put(("bar_text_destroy", None))
@@ -577,7 +578,7 @@ def rename():
         q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
     except FileNotFoundError:
-        print("File not found.")
+        logging.exception("File not found")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     q.put(("status_reset", None))
@@ -675,17 +676,18 @@ def get_hash(filepath = Path):
 
 def execute():
     try:
+        logging.info("Run started on '%s' with settings: %s", target_folder.name, cfg)
         if cfg["find"]:
-            print("Finding duplicates...")
+            logging.info("Finding duplicates...")
             duplicate_finder()
         if cfg["water"]:
             print("Adding watermarks...")
             watermark()
         if cfg["rename"]:
-            print("Renaming files...")
+            logging.info("Renaming files...")
             rename()
         if cfg["sort"]:
-            print("Sorting...")
+            logging.info("Sorting...")
             sort()
         q.put(("unlock", None))
     except Exception:
@@ -1095,7 +1097,7 @@ if tutorial_seen == 0:
         with open(memory, "w") as f:
             json.dump(tutorial_seen, f)
     except FileNotFoundError:
-        print("File not found.")
+        logging.exception("File not found")
 else:
     organize_open()
 
@@ -1118,18 +1120,24 @@ bar_text = ctk.CTkLabel(right, text="")
 q.put(("bar_text_hide", None))
 
 def open_log():
+    log_file = path / "specorde.log"
     try:
-        os.startfile(path)
-    except Exception:
-        logging.exception("Could not open log folder")
-
+        if log_file.exists():
+            os.startfile(str(log_file))
+        elif path.exists():
+            os.startfile(str(path))
+        else:
+            messagebox.showinfo("Specorde", "No log file has been created yet.")
+    except Exception as e:
+        logging.exception("Could not open log")
+        messagebox.showwarning("Specorde", f"Could not open the log.\n\nIt is saved here:\n{log_file}\n\n({e})")
 #version
 version_frame = ctk.CTkFrame(right, fg_color="transparent")
-version_label = ctk.CTkLabel(version_frame, text="v0.1 beta", text_color="grey", font=("Bahnschrift Light Condensed", 10))
+version_label = ctk.CTkLabel(version_frame, text="v0.1 demo", text_color="grey", font=("Bahnschrift Light Condensed", 10))
 version_disclaimer = ctk.CTkLabel(version_frame, text="|  Not the finished version", text_color="grey", font=("Bahnschrift Light Condensed", 10))
 log_button = ctk.CTkButton(version_frame, text="Open log", font=("Bahnschrift Light Condensed", 12), command=open_log, width=52, height=24)
 version_frame.grid(row=11, column=0, sticky="sw", padx=14, pady=(0,10))
 version_label.grid(row=0, column=0, sticky="w")
 version_disclaimer.grid(row=0, column=1, padx=(6,0), sticky="w")
-log_button.grid(row=0, column=2, padx=(64,18), sticky="e")
+log_button.grid(row=0, column=2, padx=(54,24), sticky="e")
 canvas.mainloop()
