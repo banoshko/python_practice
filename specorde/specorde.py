@@ -38,7 +38,7 @@ try:
     with open(memory, "r") as f:
         tutorial_seen = json.load(f)
 except FileNotFoundError:
-    logging.exception("File not found")
+    logging.info("File not found, building a new one...")
     memory = Path(memory)
     memory.touch(exist_ok=True)
     with open(memory, "w") as f:
@@ -596,7 +596,7 @@ def is_protected_item(item):
         if item.is_symlink():
             return True
         attributes = item.lstat().st_file_attributes
-        if attributes & (0x2 | 0x4):
+        if attributes & (0x2 | 0x4 | 0x1000 | 0x40000 | 0x400000):
             return True
     except (AttributeError, OSError):
         pass
@@ -722,7 +722,7 @@ def organize_open():
     
     middle.grid_columnconfigure(2, weight=0)
     middle.grid_rowconfigure(10, weight=1)
-    middle.grid_rowconfigure(7, weight=0)
+    middle.grid_rowconfigure(8, weight=0)
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
@@ -731,8 +731,8 @@ def organize_open():
     actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
     actions_rename.grid(sticky="nw", padx=32, pady=10, row=7)
-    execute_button.grid(row=9, column=0, padx=104,pady=10)
-
+    execute_button.grid(row=9, column=0, padx=104,pady=24)
+    file_disclaimer.grid(row=10, column=0, sticky="sw", pady=2, padx=10)
     currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
 
 def pictures_open():
@@ -1089,6 +1089,8 @@ actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift
 actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
 actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift Light Condensed", 16))
 execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
+file_disclaimer = ctk.CTkLabel(middle, text="DISCLAIMER: Files that exist only in the cloud are skipped!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+
 #show tutorial
 if tutorial_seen == 0:
     tutorial_open()
