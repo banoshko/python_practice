@@ -17,6 +17,9 @@ import queue
 from send2trash import send2trash
 import ctypes
 
+#version
+app_version = "1.0.0.1"
+
 #Developer settings
 month_dict = {
     1: "(1) January", 2: "(2) February", 3: "(3) March", 4: "(4) April", 5: "(5) May", 6: "(6) June", 7: "(7) July", 8: "(8) August", 9: "(9) September", 10: "(10) October", 11: "(11) November", 12: "(12) December"
@@ -33,6 +36,8 @@ path.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=path / "specorde.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.info("Specorde started")
 memory = path / "memory.json"
+size = 0
+dry_run = 0
 
 try:
     with open(memory, "r") as f:
@@ -176,6 +181,7 @@ def get_exif(path):
         pass
     return None
 
+
 def sort():
     global bar_text
     global status
@@ -203,7 +209,7 @@ def sort():
                             year = str(file_time.year)
                             month = month_dict[file_time.month]
                             day = str(file_time.day)
-                            print(f"{item.name} has an unsupported suffix. sorting by date modified")
+                            logging.debug("%s has an unsupported suffix, using date modified", item.name)
                         else:
                             exif_string = get_exif(item)
                             photo_date = parse_exif_date(exif_string) if exif_string else None
@@ -211,7 +217,6 @@ def sort():
                                 year = str(photo_date.year)
                                 month = month_dict[photo_date.month]
                                 day = str(photo_date.day)
-                                print(f"1 - Sorted item {item.name} by date taken.")
                             else:
                                 file_time = datetime.fromtimestamp(item.stat().st_mtime)
                                 year = str(file_time.year)
@@ -268,7 +273,6 @@ def sort():
         q.put(("bar_destroy", None))
         logging.info("Files sorted.")
     except NameError:
-        print("You must pick a folder.")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
@@ -311,7 +315,6 @@ def restore_sort():
             q.put(("status", "Everything back in its place!"))
     
     except NameError:
-        print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
     except FileNotFoundError:
         logging.exception("File not found")
@@ -413,7 +416,6 @@ def duplicate_finder():
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     except NameError:
-        print("Name Error")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
@@ -450,7 +452,6 @@ def restore_duplicate():
             q.put(("status", "Everything back in its place!"))
 
     except NameError:
-        print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
     except FileNotFoundError:
         logging.exception("File not found")
@@ -459,7 +460,6 @@ def watermark():
     try:
         ()
     except NameError:
-        print("You must pick a folder.")
         q.put(("status", "You must pick a folder."))
 
 def rename():
@@ -523,7 +523,7 @@ def rename():
                             year = str(file_time.year)
                             month = str(file_time.month).zfill(2)
                             day = str(file_time.day).zfill(2)
-                            print(f"{item.name} has an unsupported suffix. renaming by date modified")
+                            logging.debug("%s has an unsupported suffix, using date modified", item.name)
                         else:
                             exif_string = get_exif(item)
                             photo_date = parse_exif_date(exif_string) if exif_string else None
@@ -531,7 +531,6 @@ def rename():
                                 year = str(photo_date.year)
                                 month = str(photo_date.month).zfill(2)
                                 day = str(photo_date.day).zfill(2)
-                                print(f"1 - Renamed item {item.name} by date taken.")
                             else:
                                 file_time = datetime.fromtimestamp(item.stat().st_mtime)
                                 year = str(file_time.year)
@@ -572,7 +571,6 @@ def rename():
         q.put(("bar_destroy", None))
         logging.info("Files renamed.")
     except NameError:
-        print("You must pick a folder.")
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
         q.put(("status", "You must pick a folder."))
@@ -623,10 +621,11 @@ def measure_folder(folder):
     total = 0
     try:
         for f in folder.rglob("*"):
-            try:
-                total += f.stat().st_size
-            except OSError:
-                pass
+            if f not in ["sorted", "duplicates"]:
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
     except Exception:
         logging.exception("Could not measure %s", folder.name)
     folder_size = total / (1024*1024*1024)
@@ -667,7 +666,7 @@ def pick_folder():
     threading.Thread(target=measure_folder, args=(target_folder,), daemon=True).start()
 
 allowed_characters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "_", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
-def get_hash(filepath = Path):
+def get_hash(filepath:  Path):
     hasher = hashlib.sha256()
     with open(filepath, "rb") as f:
         while chunk := f.read(65536):
@@ -676,20 +675,39 @@ def get_hash(filepath = Path):
 
 def execute():
     try:
-        logging.info("Run started on '%s' with settings: %s", target_folder.name, cfg)
-        if cfg["find"]:
-            logging.info("Finding duplicates...")
-            duplicate_finder()
-        if cfg["water"]:
-            print("Adding watermarks...")
-            watermark()
-        if cfg["rename"]:
-            logging.info("Renaming files...")
-            rename()
-        if cfg["sort"]:
-            logging.info("Sorting...")
-            sort()
-        q.put(("unlock", None))
+        if dry_run == 0:
+            logging.info("Run started on '%s'", target_folder.name)
+            if cfg["find"]:
+                logging.info("Finding duplicates (%s)...", cfg["duplicate_mode"])
+                duplicate_finder()
+            if cfg["rename"]:
+                rename_detail = cfg["pattern"]
+                if rename_detail == "date + number":
+                    rename_detail = f"{rename_detail}, by {cfg['renameby']}"
+                elif rename_detail == "custom name + number":
+                    rename_detail = f"{rename_detail}, name '{cfg['custom']}'"
+                logging.info("Renaming files (%s)...", rename_detail)
+                rename()
+            if cfg["sort"]:
+                logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
+                sort()
+            q.put(("unlock", None))
+
+        elif dry_run == 1:
+            q.put(("status", "Check log."))
+            if cfg["find"]:
+                logging.info("Finding duplicates (%s)...", cfg["duplicate_mode"])
+            if cfg["rename"]:
+                rename_detail = cfg["pattern"]
+                if rename_detail == "date + number":
+                    rename_detail = f"{rename_detail}, by {cfg['renameby']}"
+                elif rename_detail == "custom name + number":
+                    rename_detail = f"{rename_detail}, name '{cfg['custom']}'"
+                logging.info("Renaming files (%s)...", rename_detail)
+            if cfg["sort"]:
+                logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
+            q.put(("unlock", None))
+            q.put(("status_reset", None))
     except Exception:
         logging.exception("Error trying to execute")
         q.put(("bar_text_destroy", None))
@@ -697,7 +715,7 @@ def execute():
         q.put(("status", "Something went wrong. See log."))
         q.put(("status_reset", None))
         q.put(("unlock", None))
-    
+
 def middle_reset():
     global header
     try:
@@ -715,9 +733,7 @@ def organize_open():
     global middle
     global currently_open
 
-    if currently_open == 0:
-        ()
-    else:
+    if not currently_open == 0:
         middle_reset()
     
     middle.grid_columnconfigure(2, weight=0)
@@ -725,30 +741,29 @@ def organize_open():
     middle.grid_rowconfigure(8, weight=0)
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,8))
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(442,8))
     actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
     actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
     actions_rename.grid(sticky="nw", padx=32, pady=10, row=7)
     execute_button.grid(row=9, column=0, padx=104,pady=24)
-    file_disclaimer.grid(row=10, column=0, sticky="sw", pady=2, padx=10)
+    footer.grid(row=10, column=0, sticky="sw", padx=14, pady=(0,4))
+    file_disclaimer.grid(row=0, column=0, sticky="w", pady=2, padx=8)
+    dry_run_button.grid(row=0, column=1, sticky="e", padx=360, pady=8)
     currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
-
-def pictures_open():
-    ()
 
 def settings_open(option=0):
     global currently_open
-    middle_reset()                     # always reset, never skip
+    middle_reset()
     middle.grid_columnconfigure(0, weight=1)
     middle.grid_rowconfigure(8, weight=1)
     header.grid(column=0, row=0, sticky="ew", pady=(0,16))
     settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
     settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,8))
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(442,8))
     if option == 1:
         water_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
         water_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
@@ -767,18 +782,64 @@ def settings_change(option=0):
 def tutorial_open():
     global middle
     global currently_open
-    if currently_open == 2:
-        ()
-    else:
+    if not currently_open == 2:
         middle_reset()
     middle.grid_columnconfigure(0, weight=1)
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,190))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(378,8))
+    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(442,8))
     tutorial_frame.grid(row=1, column=0, sticky="nw", padx=18)
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
- 
+
+def pictures_open(option=0):
+    global middle
+    global currently_open
+    middle_reset()
+    middle.grid_columnconfigure(0, weight=1)
+    middle.grid_rowconfigure(8, weight=1)
+    header.grid(column=0, row=0, sticky="ew", pady=(0,16))
+    pictures_frame.grid(row=2, column=0, sticky="ew")
+    pictures_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
+    folder_browser.grid(row=0, column=1, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
+    folder_chosen.grid(row=0, column=1, columnspan=2, sticky="w", pady=(24,18), padx=(304,8))
+    pictures_overview.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
+    pictures_culling.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
+    pictures_size_label.grid(sticky="e", pady=8, padx=(0,95), column=2, row=1)
+    pictures_size_changer.grid(sticky="se", pady=10, padx=(8,16), column=2, row=1)
+    row = 0
+    column = 0
+    try:
+        if option == 0:
+            for pic in target_folder.iterdir():
+                if pic.is_file() and pic.suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff", "webp", ".bmp"]:
+                    if column == 4:
+                        row += 1
+                        column = 0
+                    column += 1
+        elif option == 1:
+            ()
+    except NameError:
+        no_folder_chosen_error = ctk.CTkLabel(middle, text="No folder chosen yet.", font=("Bahnschrift Light Condensed", 28))
+        no_folder_chosen_error.grid(row=1, pady=20)
+    currently_open = 3
+
+def pictures_change(option=0):
+    pictures_open(option)
+
+def pictures_size():
+    global size
+    if size != 2:
+        size +=1
+    else:
+        size=0
+    if size==0:
+        pictures_size_changer.configure(text="Small")
+    elif size==1:
+        pictures_size_changer.configure(text="Medium")
+    else:
+        pictures_size_changer.configure(text="Large")
+    #return pic_width, pic_height
 
 def resource_path(name):
     if getattr(sys, "frozen", False):
@@ -790,13 +851,13 @@ def resource_path(name):
 #tk
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("specorde")
+ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Specorde.Specorde")
 canvas = ctk.CTk()
 def log_tk_error(exc, val, tb):
     logging.error("Unhandled error", exc_info=(exc, val, tb))
-canvas.report_callback_exception = log_tk_error
+#canvas.report_callback_exception = log_tk_error
 canvas.title("Specorde")
-canvas.geometry("1024x576")
+canvas.geometry("1152x648")
 canvas.resizable(width=False, height=False)
 try:
     logo = ImageTk.PhotoImage(Image.open(str(resource_path("specorde_logo.ico"))))
@@ -807,7 +868,7 @@ except Exception:
 check_messages()
 
 #left
-left = ctk.CTkFrame(canvas, width=200, height=576, fg_color="#1f2029", corner_radius=0)
+left = ctk.CTkFrame(canvas, width=214, height=648, fg_color="#1f2029", corner_radius=0)
 left.grid(row = 0, column = 0)
 left.grid_propagate(False)
 left.grid_columnconfigure(0, weight=1)
@@ -827,9 +888,11 @@ settings_button.grid(sticky="nw", pady=18, padx=18)
 
 tutorial_button = ctk.CTkButton(left, text="Tutorial", font=("Bahnschrift Light Condensed", 16), command=tutorial_open)
 tutorial_button.grid(sticky="nw", pady=18, padx=18)
+left_footer = ctk.CTkLabel(left, text=f"© 2026 Richard Vajko", text_color="grey", font=("Bahnschrift Light Condensed", 11), justify="left")
+left_footer.grid(row=10, column=0, sticky="sw", pady=2, padx=10)
 
 #middle
-middle = ctk.CTkFrame(canvas, width=564, height=576, fg_color="#20222e", corner_radius=0)
+middle = ctk.CTkFrame(canvas, width=678, height=648, fg_color="#20222e", corner_radius=0)
 middle.grid(row = 0, column = 1)
 middle.grid_propagate(False)
 middle.grid_columnconfigure(0, weight=1)
@@ -842,6 +905,14 @@ header.grid_columnconfigure(1, weight=1)
 header.grid_columnconfigure(0, minsize=150)
 folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18), width=124, height=29)
 folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14), anchor="w")
+
+#pictures
+pictures_frame = ctk.CTkScrollableFrame(middle, width=664, height=648, fg_color="#20222e")
+pictures_label = ctk.CTkLabel(header, text="Pictures", font=("Bahnschrift Light Condensed", 32))
+pictures_overview = ctk.CTkButton(header, command=lambda: pictures_change(0), text="Overview", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
+pictures_culling = ctk.CTkButton(header, command=lambda: pictures_change(1), text="Culling", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
+pictures_size_label = ctk.CTkLabel(header, text="Density: ", font=("Bahnschrift Light Condensed", 13))
+pictures_size_changer = ctk.CTkButton(header, command=pictures_size, text="Middle", font=("Bahnschrift Light Condensed", 13), width=77, height=14)
 
 #tutorial
 tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 30))
@@ -957,12 +1028,10 @@ def custom_check(event=None):
     global check
     text = settings_rename_custom.get('1.0', "end-1c")
     if len(text) > 16:
-        print("Your custom name can't have more than 16 characters!")
         check_text.configure(text="Your custom name can't have more than 16 characters!")
         custom_check_icon.configure(text="!")
         check = 0
     elif text == "":
-        print("Your custom name can't be empty!")
         check_text.configure(text="Your custom name can't be empty!")
         custom_check_icon.configure(text="!")
         check = 0
@@ -974,13 +1043,11 @@ def custom_check(event=None):
                 check = 0
                 break
             elif char not in allowed_characters:
-                print(f"Your custom name can't have '{char}'!")
                 check_text.configure(text=f"Your custom name can't have '{char}'!")
                 custom_check_icon.configure(text="!")
                 check = 0
                 break
         else:
-            print(f"Your custom name is: '{text}'")
             check_text.configure(text=f"Your custom name is:  ' {text} '")
             custom_check_icon.configure(text="✓")
             check = 1
@@ -1081,6 +1148,22 @@ set_wat_plus = ctk.CTkButton(watermark_size_subframe, text="+", command=plus, fo
 set_wat_minus.grid(row=0,column=0, padx=(65,0), sticky="w")
 settings_watermark_size.grid(row=0, column=1, padx=5, pady=8, sticky="w")
 set_wat_plus.grid(row=0,column=2, padx=(0,16), sticky="w")
+
+def dry_run_toggle():
+    global dry_run
+    global execute_button
+    if dry_run == 0:
+        dry_run = 1
+        execute_button.configure(text_color="grey")
+        q.put(("status", "Dry run turned on."))
+        logging.info("Dry run turned off.")
+    else:
+        dry_run = 0
+        execute_button.configure(text_color="white")
+        q.put(("status", "Dry run turned off."))
+        logging.info("Dry run turned off.")
+    q.put(("status_reset", None))
+
 #organize
 organize_title = ctk.CTkLabel(header, text="Organize", font=("Bahnschrift Light Condensed", 30))
 actions_title = ctk.CTkLabel(middle, text="Functions", text_color="grey", font=("Bahnschrift Light Condensed", 20))
@@ -1089,7 +1172,10 @@ actions_water = ctk.CTkCheckBox(middle, text="Add watermark", font=("Bahnschrift
 actions_sort = ctk.CTkCheckBox(middle, text="Sort files", font=("Bahnschrift Light Condensed", 16))
 actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift Light Condensed", 16))
 execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
-file_disclaimer = ctk.CTkLabel(middle, text="DISCLAIMER: Files that exist only in the cloud are skipped!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+footer = ctk.CTkFrame(middle, width=678, fg_color="#20222e")
+footer.columnconfigure(0, weight=0)
+file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Files that exist only in the cloud are skipped!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+dry_run_button = ctk.CTkButton(footer, text="Dry run", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
 
 #show tutorial
 if tutorial_seen == 0:
@@ -1105,12 +1191,11 @@ else:
 
 #right
 
-right = ctk.CTkFrame(canvas, width=260, height=576, fg_color="#1f2029", corner_radius=0)
+right = ctk.CTkFrame(canvas, width=260, height=648, fg_color="#1f2029", corner_radius=0)
 right.grid(row = 0, column = 2)
 right.grid_propagate(False)
 right.grid_columnconfigure(0, weight=1)
 right.grid_rowconfigure(10, weight=1)
-
 right_title = ctk.CTkLabel(right, text="Activity", font=("Bahnschrift Light Condensed", 30))
 right_title.grid(sticky="nw", pady=18, padx=18)
 
@@ -1121,25 +1206,66 @@ q.put(("bar_hide", None))
 bar_text = ctk.CTkLabel(right, text="")
 q.put(("bar_text_hide", None))
 
-def open_log():
-    log_file = path / "specorde.log"
+log_window = None
+
+def close_log():
+    global log_window
+    if log_window is not None:
+        try:
+            log_window.destroy()
+        except Exception:
+            pass
+        log_window = None
+
+def set_log_icon():
     try:
-        if log_file.exists():
-            os.startfile(str(log_file))
-        elif path.exists():
-            os.startfile(str(path))
-        else:
-            messagebox.showinfo("Specorde", "No log file has been created yet.")
+        if log_window is not None and log_window.winfo_exists():
+            log_window.iconbitmap(str(resource_path("specorde_logo.ico")))
+    except Exception:
+        logging.exception("Log window icon failed")
+
+def drop_topmost():
+    try:
+        if log_window is not None and log_window.winfo_exists():
+            log_window.attributes("-topmost", False)
+    except Exception:
+        logging.exception("Could not reset topmost")
+
+def open_log():
+    global log_window
+    if log_window is not None:
+        close_log()
+        return
+    log_file = path / "specorde.log"
+    if not log_file.exists():
+        messagebox.showinfo("Specorde", "No log file has been created yet.")
+        return
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-300:]
+        log_window = ctk.CTkToplevel(canvas)
+        log_window.title("Specorde log")
+        log_window.geometry("720x420")
+        log_window.protocol("WM_DELETE_WINDOW", close_log)
+        box = ctk.CTkTextbox(log_window, wrap="word", font=("Consolas", 12))
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+        box.insert("1.0", "".join(lines))
+        box.see("end")
+        box.configure(state="disabled")
+        log_window.after(300, set_log_icon)
+        log_window.attributes("-topmost", True)
+        log_window.after(300, drop_topmost)
+        log_window.focus_force()
     except Exception as e:
-        logging.exception("Could not open log")
-        messagebox.showwarning("Specorde", f"Could not open the log.\n\nIt is saved here:\n{log_file}\n\n({e})")
+        logging.exception("Could not show log")
+        close_log()
+        messagebox.showwarning("Specorde", f"Could not show the log.\n\n({e})")
 #version
 version_frame = ctk.CTkFrame(right, fg_color="transparent")
-version_label = ctk.CTkLabel(version_frame, text="v0.1 demo", text_color="grey", font=("Bahnschrift Light Condensed", 10))
-version_disclaimer = ctk.CTkLabel(version_frame, text="|  Not the finished version", text_color="grey", font=("Bahnschrift Light Condensed", 10))
+version_label = ctk.CTkLabel(version_frame, text=f"v{app_version}", text_color="grey", font=("Bahnschrift Light Condensed", 10))
 log_button = ctk.CTkButton(version_frame, text="Open log", font=("Bahnschrift Light Condensed", 12), command=open_log, width=52, height=24)
 version_frame.grid(row=11, column=0, sticky="sw", padx=14, pady=(0,10))
 version_label.grid(row=0, column=0, sticky="w")
-version_disclaimer.grid(row=0, column=1, padx=(6,0), sticky="w")
-log_button.grid(row=0, column=2, padx=(54,24), sticky="e")
+log_button.grid(row=0, column=2, padx=(152,24), sticky="e")
+
 canvas.mainloop()
