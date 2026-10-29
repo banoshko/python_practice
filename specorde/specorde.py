@@ -1,4 +1,4 @@
- #This is my attempt at making an actually sellable product.
+#This is my attempt at making an actually sellable product.
 #Not even 2 weeks into python at this point
 #Start - Sunday, 27th Sep. 2026
 
@@ -18,7 +18,7 @@ from send2trash import send2trash
 import ctypes
 
 #version
-app_version = "1.0.0.1"
+app_version = "1.0.1.0"
 
 #Developer settings
 month_dict = {
@@ -140,14 +140,17 @@ def check_messages():
             elif kind == "lock":
                 execute_button.configure(fg_color="#173348", state="disabled")
                 folder_browser.configure(fg_color="#173348", state="disabled")
+                restore_button.configure(fg_color="#173348", state="disabled")
+                dry_run_button.configure(fg_color="#173348", state="disabled")
             elif kind == "unlock":
                 execute_button.configure(fg_color="#1f6aa5", state="normal")
                 folder_browser.configure(fg_color="#1f6aa5", state="normal")
+                restore_button.configure(fg_color="#1f6aa5", state="normal")
+                dry_run_button.configure(fg_color="#1f6aa5", state="normal")
             elif kind == "folder_reset":
                 folder_browser.configure(text="Choose a new folder")
                 folder_chosen.configure(text="Folder chosen:")
-    except queue.Empty:
-        pass
+    except queue.Empty: pass
     canvas.after(20, check_messages)
 
 def parse_exif_date(text):
@@ -160,6 +163,9 @@ def safe_rename(item, destination):
     try:
         item.rename(destination)
         note = {"from": str(item), "to": str(destination)}
+        if not journal_name.exists():
+            with open(journal_name, "w") as f:
+                f.write(json.dumps({"folder": str(target_folder)}) + "\n")
         with open(journal_name, "a") as f:
             f.write(json.dumps(note) + "\n")
     except OSError:
@@ -168,15 +174,15 @@ def safe_rename(item, destination):
 def find_last_run():
     try:
         for file in sorted(journal_path.glob("run_*.jsonl"), reverse=True):
-            with open(file) as f:
-                header = json.loads(f.readline())
+            try:
+                with open(file) as f:
+                        header = json.loads(f.readline())
+            except Exception: continue
             if header.get("folder") == str(target_folder):
                 return file
         return None #display message here if folder not restorable
-    except FileNotFoundError:
-        pass
-    except PermissionError:
-        pass
+    except FileNotFoundError: pass
+    except PermissionError: pass
 
 def get_exif(path):
     try:
@@ -186,21 +192,18 @@ def get_exif(path):
                 date_str = None
                 try:
                     date_str = exif.get_ifd(0x8769).get(36867)
-                except Exception:
-                    pass
+                except Exception: pass
                 date_str = date_str or exif.get(36867) or exif.get(306)
                 if not date_str:
                     try:
                         exif_ifd = exif.get_ifd(0x8769)
                         date_str = exif_ifd.get(36867) or exif_ifd.get(306)
-                    except Exception:
-                        pass
+                    except Exception: pass
                 if date_str:
                     if isinstance(date_str, bytes):
                         return date_str.decode('utf-8', errors='ignore').strip()
                     return str(date_str).strip()
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 
@@ -284,8 +287,7 @@ def sort():
                         q.put(("bar_text", f"{percent :.2f}%"))
                         q.put(("bar_set", percent/100))
 
-                    except ZeroDivisionError:
-                        ()
+                    except ZeroDivisionError: pass
             except Exception:
                 logging.exception("Could not sort %s", item.name)
 
@@ -315,87 +317,66 @@ def remove_duplicate(file, mode):
         while destination.exists():
             destination = duplicates / f"{file.stem}_{counter}{file.suffix}"
             counter += 1
-        file.rename(destination)
+        safe_rename(file, destination)
     elif mode == "Deleted":
         send2trash(str(file))
 
 def duplicate_finder():
-    global bar_text
-    global status
-    global bar
     try:
-        changed =0
+        changed = 0
         seen = {}
-        size = 0
         mode = cfg["duplicate_mode"]
+
+        files = list_files(target_folder)
+        total = sum(s for _, s in files) or 1   # never 0
+        done = 0
+
         q.put(("bar_set", 0))
-        for item in list(target_folder.iterdir()):
-            q.put(("bar_show", None))
-            q.put(("bar_text_show", None))
-            if item.is_file() and not is_protected_item(item):
-                try:
-                    if item.stat().st_size == 0:
-                        continue
-                    hash = get_hash(item)
-                except OSError:
-                    logging.exception("Could not read %s", item.name)
-                    continue
-                try:
-                    size = size + item.stat().st_size / (1024*1024*1024)
-                except FileNotFoundError:
-                    logging.warning(f"File {item.name} not found")
+        q.put(("bar_show", None))
+        q.put(("bar_text_show", None))
 
-                if hash in seen:
-                    if mode == "Moved to a folder":
-                        duplicates.mkdir(exist_ok=True)
-                    try:
-                        if is_copy(seen[hash]) and not is_copy(item):
-                            remove_duplicate(seen[hash], mode)
-                            seen[hash] = item
-                        else:
-                            remove_duplicate(item, mode)
-                        changed = 1
-                    except Exception:
-                        logging.exception("Could not remove duplicate %s", item.name)
-                else:
-                    seen[hash] = item
+        for item, item_size in files:
+            done += item_size
+            percent = min(done / total * 100, 100)
+            q.put(("status", "Almost there!" if percent > 80 else "Finding duplicates"))
+            q.put(("bar_text", f"{percent:.2f}%"))
+            q.put(("bar_set", percent / 100))
 
+            if item_size == 0: continue
+            try:
+                file_hash = get_hash(item)
+            except OSError:
+                logging.exception("Could not read %s", item.name)
+                continue
+
+            if file_hash in seen:
+                if mode == "Moved to a folder":
+                    duplicates.mkdir(exist_ok=True)
                 try:
-                    percent = size / folder_size * 100
-                    if percent > 80:
-                        q.put(("status", "Almost there!"))
+                    if is_copy(seen[file_hash]) and not is_copy(item):
+                        remove_duplicate(seen[file_hash], mode)
+                        seen[file_hash] = item
                     else:
-                        q.put(("status", "Finding duplicates"))
-                    q.put(("bar_text", f"{percent :.2f}%"))
-                    q.put(("bar_set", percent/100))
-                except ZeroDivisionError:
-                    ()
+                        remove_duplicate(item, mode)
+                    changed = 1
+                except Exception:
+                    logging.exception("Could not remove duplicate %s", item.name)
             else:
-                try:
-                    size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
-                except FileNotFoundError:
-                    logging.warning(f"File {item.name} not found")
+                seen[file_hash] = item
+
         if mode == "Moved to a folder":
-            if not duplicates.exists():
-                q.put(("bar_text", "100%"))
-                q.put(("status", "No duplicates found!"))
-            elif not any(duplicates.iterdir()):
-                q.put(("bar_text", "100%"))
-                q.put(("status", "No duplicates found!"))    
-            elif duplicates.exists():
-                if changed == 0:
-                    q.put(("bar_text", "100%"))
-                    q.put(("status", "No new duplicates!"))
-                elif changed == 1:
-                    q.put(("bar_text", "100%"))
-                    q.put(("status", "All duplicates found!"))
-        elif mode == "Deleted":
-            if changed == 0:
-                q.put(("bar_text", "100%"))
-                q.put(("status", "No duplicates found!"))
-            elif changed == 1:
-                q.put(("bar_text", "100%"))
-                q.put(("status", "Duplicates removed!"))
+            if not duplicates.exists() or not any(duplicates.iterdir()):
+                result = "No duplicates found!"
+            elif changed == 0:
+                result = "No new duplicates!"
+            else:
+                result = "All duplicates found!"
+        else:
+            result = "Duplicates removed!" if changed else "No duplicates found!"
+
+        q.put(("bar_set", 1))
+        q.put(("bar_text", "100%"))
+        q.put(("status", result))
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
     except NameError:
@@ -408,6 +389,8 @@ def duplicate_finder():
         q.put(("bar_destroy", None))
     except PermissionError:
         logging.exception("Duplicate finder: permission denied")
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
     q.put(("status_reset", None))
 
 def watermark():
@@ -454,8 +437,7 @@ def rename():
                         q.put(("status", "Renaming the files"))
                     q.put(("bar_text", f"{percent :.2f}%"))
                     q.put(("bar_set", percent/100))
-                except ZeroDivisionError:
-                    ()
+                except ZeroDivisionError: pass
                                     
                 if choice == "date + number":
                     if renameby == "Date modified":
@@ -550,9 +532,18 @@ def is_protected_item(item):
         attributes = item.lstat().st_file_attributes
         if attributes & (0x2 | 0x4 | 0x1000 | 0x40000 | 0x400000):
             return True
-    except (AttributeError, OSError):
-        pass
+    except (AttributeError, OSError): pass
     return False
+
+def list_files(folder):
+    files = []
+    for f in folder.iterdir():
+        try:
+            if f.is_file() and not is_protected_item(f):
+                files.append((f, f.stat().st_size))
+        except OSError:
+            continue
+    return files
 
 def is_dangerous(folder):
     folder = folder.resolve()
@@ -578,8 +569,7 @@ def measure_folder(folder):
             if f not in ["sorted_specorde", "duplicates_specorde"]:
                 try:
                     total += f.stat().st_size
-                except OSError:
-                    pass
+                except OSError: pass
     except Exception:
         logging.exception("Could not measure %s", folder.name)
     folder_size = total / (1024*1024*1024)
@@ -629,16 +619,12 @@ def get_hash(filepath:  Path):
 
 def execute():
     global journal_name
-    journal_path.mkdir(exist_ok=True)
+    q.put(("lock", None))
     try:
+        journal_path.mkdir(exist_ok=True)
+        journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
         if dry_run == 0:
             logging.info("Run started on '%s'", target_folder.name)
-
-            if cfg["sort"] or cfg["rename"]:
-                journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
-                with open(journal_name, "w") as f:
-                    f.write(json.dumps({"folder": str(target_folder)}) + "\n")
- 
             if cfg["find"]:
                 logging.info("Finding duplicates (%s)...", cfg["duplicate_mode"])
                 duplicate_finder()
@@ -653,7 +639,6 @@ def execute():
             if cfg["sort"]:
                 logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
                 sort()
-            q.put(("unlock", None))
         elif dry_run == 1:
             q.put(("status", "Check log."))
             if cfg["find"]:
@@ -667,7 +652,6 @@ def execute():
                 logging.info("Renaming files (%s)...", rename_detail)
             if cfg["sort"]:
                 logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
-            q.put(("unlock", None))
             q.put(("status_reset", None))
     except Exception:
         logging.exception("Error trying to execute")
@@ -675,6 +659,8 @@ def execute():
         q.put(("bar_destroy", None))
         q.put(("status", "Something went wrong. See log."))
         q.put(("status_reset", None))
+        q.put(("unlock", None))
+    finally:
         q.put(("unlock", None))
 
 def restore_duplicates(source, dest):
@@ -728,16 +714,13 @@ def restore_sorted(source, dest):
                             logging.error("Could not restore %s", item.name)
                     try:
                         month_sub.rmdir()
-                    except OSError:
-                        ()
+                    except OSError: pass
             try:
                 month.rmdir()
-            except OSError:
-                ()
+            except OSError: pass
         try:
             year.rmdir()
-        except OSError:
-            ()
+        except OSError: pass
     return moved
 
 def restore_from_journal(entries):
@@ -762,8 +745,7 @@ def restore_from_journal(entries):
             moved_sort = restore_sorted(sorted_dir, target_folder)
             try:
                 sorted_dir.rmdir()
-            except OSError:
-                ()
+            except OSError: pass
         if moved_sort:
             moved = 1
         return moved
@@ -772,92 +754,86 @@ def start_restoring():
     global target_folder
     entries = []
     moved = 0
-    counter = 0
     targed_folder_remove = 0
     if "target_folder" not in globals():
         q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
         return
-    
-    journal_file = find_last_run()
-    if journal_file is None:
-        if not duplicates.exists() and not sorted_dir.exists():
-            if target_folder.name != "sorted_specorde" and target_folder.name != "duplicates_specorde":
+    q.put(("lock", None))
+    try:
+        
+        journal_file = find_last_run()
+        if journal_file is None:
+            if not duplicates.exists() and not sorted_dir.exists():
+                if target_folder.name != "sorted_specorde" and target_folder.name != "duplicates_specorde":
+                    q.put(("status", "Nothing to restore..."))
+                    q.put(("status_reset", None))
+                    return
+        if not target_folder.is_dir():
+            q.put(("status", "Your chosen folder no longer exists."))
+            q.put(("status_reset", None))
+            return
+
+        elif not journal_file is None:
+            q.put(("status", "Restoring..."))
+            with open(journal_file) as f:
+                f.readline()
+                for line in f:
+                    try:
+                        item = json.loads(line)
+                        entries.append(item)
+                    except json.JSONDecodeError: continue
+
+        if target_folder.name == "sorted_specorde":
+            moved = restore_sorted(target_folder, target_folder.parent)
+            targed_folder_remove = 1
+            if moved:
+                q.put(("status", "Everything back in its place!"))
+            else:
                 q.put(("status", "Nothing to restore..."))
-                q.put(("status_reset", None))
-                return
-    if not target_folder.is_dir():
-        q.put(("status", "Your chosen folder no longer exists."))
-        q.put(("status_reset", None))
-        return
+            q.put(("status_reset", None))
 
-    elif not journal_file is None:
-        q.put(("status", "Restoring..."))
-        with open(journal_file) as f:
-            f.readline()
-            for line in f:
-                try:
-                    item = json.loads(line)
-                    entries.append(item)
-                except json.JSONDecodeError:
-                    continue
+        elif target_folder.name == "duplicates_specorde":
+            moved = restore_duplicates(target_folder, target_folder.parent)
+            targed_folder_remove = 1
+            if moved:
+                q.put(("status", "Everything back in its place!"))
+            else:
+                q.put(("status", "Nothing to restore..."))
+            q.put(("status_reset", None))
 
-    if target_folder.name == "sorted_specorde":
-        moved = restore_sorted(target_folder, target_folder.parent)
-        targed_folder_remove = 1
-        if moved:
-            q.put(("status", "Everything back in its place!"))
         else:
-            q.put(("status", "Nothing to restore..."))
-        q.put(("status_reset", None))
+            moved = restore_from_journal(entries)
+            duplicates_moved = restore_duplicates(duplicates, target_folder)
+            try:
+                duplicates.rmdir()
+            except OSError: pass
+            if moved or duplicates_moved:
+                q.put(("status", "Everything back in its place!"))
+            else:
+                q.put(("status", "Nothing to restore..."))
+            q.put(("status_reset", None))
 
-    elif target_folder.name == "duplicates_specorde":
-        moved = restore_duplicates(target_folder, target_folder.parent)
-        targed_folder_remove = 1
-        if moved:
-            q.put(("status", "Everything back in its place!"))
-        else:
-            q.put(("status", "Nothing to restore..."))
-        q.put(("status_reset", None))
+        if journal_file is not None:
+            try:
+                journal_file.rename(journal_file.with_suffix(".used"))
+            except OSError: pass
 
-    else:
-        moved = restore_from_journal(entries)
-        duplicates_moved = restore_duplicates(duplicates, target_folder)
-        try:
-            duplicates.rmdir()
-        except OSError:
-            ()
-        if moved or duplicates_moved:
-            q.put(("status", "Everything back in its place!"))
-        else:
-            q.put(("status", "Nothing to restore..."))
-        q.put(("status_reset", None))
-
-    if moved and journal_file is not None:
-        try:
-            journal_file.rename(journal_file.with_suffix(".used"))
-        except OSError:
-            ()
-
-    if targed_folder_remove == 1:
-        try:
-            target_folder.rmdir()
-            del target_folder
-            q.put(("folder_reset", None))
-        except OSError:
-            ()
-
-
-
-
+        if targed_folder_remove == 1:
+            try:
+                target_folder.rmdir()
+                del target_folder
+                q.put(("folder_reset", None))
+            except OSError: pass
+    finally:
+        q.put(("unlock", None))
 
 def middle_reset():
     global header
     try:
         for widget in header.winfo_children():
             widget.grid_forget()
-    except Exception:
-        pass
+    except Exception: pass
     for widget in middle.winfo_children():
         widget.grid_forget()
 
@@ -1352,8 +1328,7 @@ def close_log():
     if log_window is not None:
         try:
             log_window.destroy()
-        except Exception:
-            pass
+        except Exception: pass
         log_window = None
 
 def set_log_icon():
