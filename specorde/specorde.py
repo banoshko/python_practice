@@ -36,6 +36,8 @@ path.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=path / "specorde.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.info("Specorde started")
 memory = path / "memory.json"
+journal_path = path / "journals"
+journal_name = None
 size = 0
 dry_run = 0
 
@@ -73,6 +75,7 @@ def run_execute():
         q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
         return
+    
     if not (actions_find.get() or actions_sort.get() or actions_rename.get()):
         q.put(("status", "Tick at least one function."))
         q.put(("status_reset", None))
@@ -140,6 +143,9 @@ def check_messages():
             elif kind == "unlock":
                 execute_button.configure(fg_color="#1f6aa5", state="normal")
                 folder_browser.configure(fg_color="#1f6aa5", state="normal")
+            elif kind == "folder_reset":
+                folder_browser.configure(text="Choose a new folder")
+                folder_chosen.configure(text="Folder chosen:")
     except queue.Empty:
         pass
     canvas.after(20, check_messages)
@@ -153,8 +159,24 @@ def parse_exif_date(text):
 def safe_rename(item, destination):
     try:
         item.rename(destination)
+        note = {"from": str(item), "to": str(destination)}
+        with open(journal_name, "a") as f:
+            f.write(json.dumps(note) + "\n")
     except OSError:
         logging.exception("Could not move or rename %s", item.name)
+
+def find_last_run():
+    try:
+        for file in sorted(journal_path.glob("run_*.jsonl"), reverse=True):
+            with open(file) as f:
+                header = json.loads(f.readline())
+            if header.get("folder") == str(target_folder):
+                return file
+        return None #display message here if folder not restorable
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        pass
 
 def get_exif(path):
     try:
@@ -283,45 +305,6 @@ def sort():
         q.put(("bar_destroy", None))
     q.put(("status_reset", None))
 
-def restore_sort():
-    global bar_text
-    global status
-    global bar
-    try:
-        if target_folder.name == "sorted":
-            q.put(("status", "Restoring sorted files..."))
-            for year in target_folder.iterdir():
-                for month in year.iterdir():
-                    for file in month.iterdir():
-                        file.rename(target_folder.parent/file.name)
-                    month.rmdir()
-                year.rmdir()
-            target_folder.rmdir()
-            status.after(500)
-            q.put(("status", "Everything back in its place!"))
-            q.put(("status_reset", None))
-        elif not sorted_dir.exists():
-            q.put(("status", "Nothing to restore."))
-        else:
-            q.put(("status", "Restoring sorted files...")) 
-            for year in sorted_dir.iterdir():
-                for month in year.iterdir():
-                    for file in month.iterdir():
-                        file.rename(target_folder/file.name)
-                    month.rmdir()
-                year.rmdir()
-            sorted_dir.rmdir()
-            status.after(500)
-            q.put(("status", "Everything back in its place!"))
-    
-    except NameError:
-        q.put(("status", "You must pick a folder."))
-    except FileNotFoundError:
-        logging.exception("File not found")
-    except PermissionError:
-        logging.exception("Restore: permission denied")
-    q.put(("status_reset", None))
-
 def is_copy(file):
     return any(suf in file.stem for suf in suffix)
 
@@ -427,35 +410,6 @@ def duplicate_finder():
         logging.exception("Duplicate finder: permission denied")
     q.put(("status_reset", None))
 
-def restore_duplicate():
-    global status
-    global bar_text
-    global bar
-    try:
-        if target_folder.name == "duplicates":
-            q.put(("status", "Restoring duplicates..."))
-            for item in list(target_folder.iterdir()):
-                item.rename(target_folder.parent/item.name)
-            target_folder.rmdir()
-            status.after(500)
-            q.put(("status", "Everything back in its place!"))
-    
-        elif not duplicates.exists():
-            q.put(("status", "Nothing to restore."))
-        else:
-            q.put(("status", "Restoring duplicates..."))  
-            for file in duplicates.iterdir():
-                if file.is_file():
-                    file.rename(target_folder/file.name)
-            duplicates.rmdir()
-            status.after(500)
-            q.put(("status", "Everything back in its place!"))
-
-    except NameError:
-        q.put(("status", "You must pick a folder."))
-    except FileNotFoundError:
-        logging.exception("File not found")
-    q.put(("status_reset", None))
 def watermark():
     try:
         ()
@@ -621,7 +575,7 @@ def measure_folder(folder):
     total = 0
     try:
         for f in folder.rglob("*"):
-            if f not in ["sorted", "duplicates"]:
+            if f not in ["sorted_specorde", "duplicates_specorde"]:
                 try:
                     total += f.stat().st_size
                 except OSError:
@@ -658,8 +612,8 @@ def pick_folder():
         shown_text = f"Folder chosen: '{shown_name.rstrip()}...'"
     folder_chosen.configure(text=shown_text)
 
-    sorted_dir = Path(target_folder/"sorted")
-    duplicates = Path(target_folder/"duplicates")
+    sorted_dir = Path(target_folder/"sorted_specorde")
+    duplicates = Path(target_folder/"duplicates_specorde")
     folder_size = 0
     q.put(("lock", None))
     q.put(("status", "Reading folder..."))
@@ -674,9 +628,17 @@ def get_hash(filepath:  Path):
     return hasher.hexdigest()
 
 def execute():
+    global journal_name
+    journal_path.mkdir(exist_ok=True)
     try:
         if dry_run == 0:
             logging.info("Run started on '%s'", target_folder.name)
+
+            if cfg["sort"] or cfg["rename"]:
+                journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
+                with open(journal_name, "w") as f:
+                    f.write(json.dumps({"folder": str(target_folder)}) + "\n")
+ 
             if cfg["find"]:
                 logging.info("Finding duplicates (%s)...", cfg["duplicate_mode"])
                 duplicate_finder()
@@ -692,7 +654,6 @@ def execute():
                 logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
                 sort()
             q.put(("unlock", None))
-
         elif dry_run == 1:
             q.put(("status", "Check log."))
             if cfg["find"]:
@@ -715,6 +676,180 @@ def execute():
         q.put(("status", "Something went wrong. See log."))
         q.put(("status_reset", None))
         q.put(("unlock", None))
+
+def restore_duplicates(source, dest):
+    moved = 0
+    if source.exists():
+        q.put(("status", "Restoring duplicates..."))        
+        for item in list(source.iterdir()):
+                counter = 0
+                destination = dest/item.name
+                while destination.exists():
+                    counter += 1
+                    destination = Path(f"{dest}/{item.stem}_restored_{counter}{item.suffix}")
+                try:
+                    item.rename(destination)
+                    moved = 1
+                except OSError:
+                    logging.error("Could not restore %s", item.name)
+    return moved
+
+def restore_sorted(source, dest):
+    moved = 0
+    for year in list(source.iterdir()):
+        if not year.is_dir():
+            continue
+        for month in list(year.iterdir()):
+            if not month.is_dir():
+                continue
+            for month_sub in list(month.iterdir()):
+                if month_sub.is_file():
+                    counter = 0
+                    destination = dest/month_sub.name
+                    while destination.exists():
+                        counter += 1
+                        destination = Path(f"{dest}/{month_sub.stem}_restored_{counter}{month_sub.suffix}")
+                    try:
+                        month_sub.rename(destination)
+                        moved = 1
+                    except OSError:
+                        logging.error("Could not restore %s", month_sub.name)
+                else:
+                    for item in list(month_sub.iterdir()):
+                        counter = 0
+                        destination = dest/item.name
+                        while destination.exists():
+                            counter += 1
+                            destination = Path(f"{dest}/{item.stem}_restored_{counter}{item.suffix}")
+                        try:
+                            item.rename(destination)
+                            moved = 1
+                        except OSError:
+                            logging.error("Could not restore %s", item.name)
+                    try:
+                        month_sub.rmdir()
+                    except OSError:
+                        ()
+            try:
+                month.rmdir()
+            except OSError:
+                ()
+        try:
+            year.rmdir()
+        except OSError:
+            ()
+    return moved
+
+def restore_from_journal(entries):
+        moved = 0
+        moved_sort = 0
+        for entry in reversed(entries):
+            moved_to = Path(entry["to"])
+            original = Path(entry["from"])
+
+            if moved_to.exists():
+                try:
+                    counter = 0
+                    destination = original
+                    while destination.exists():
+                        counter += 1
+                        destination = Path(f"{original.parent}/{original.stem}_restored_{counter}{original.suffix}")
+                    moved_to.rename(destination)
+                    moved = 1
+                except OSError:
+                    logging.exception("Could not restore %s", moved_to.name)
+        if sorted_dir.exists():
+            moved_sort = restore_sorted(sorted_dir, target_folder)
+            try:
+                sorted_dir.rmdir()
+            except OSError:
+                ()
+        if moved_sort:
+            moved = 1
+        return moved
+
+def start_restoring():
+    global target_folder
+    entries = []
+    moved = 0
+    counter = 0
+    targed_folder_remove = 0
+    if "target_folder" not in globals():
+        q.put(("status", "You must pick a folder."))
+        q.put(("status_reset", None))
+        return
+    
+    journal_file = find_last_run()
+    if journal_file is None:
+        if not duplicates.exists() and not sorted_dir.exists():
+            if target_folder.name != "sorted_specorde" and target_folder.name != "duplicates_specorde":
+                q.put(("status", "Nothing to restore..."))
+                q.put(("status_reset", None))
+                return
+    if not target_folder.is_dir():
+        q.put(("status", "Your chosen folder no longer exists."))
+        q.put(("status_reset", None))
+        return
+
+    elif not journal_file is None:
+        q.put(("status", "Restoring..."))
+        with open(journal_file) as f:
+            f.readline()
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    entries.append(item)
+                except json.JSONDecodeError:
+                    continue
+
+    if target_folder.name == "sorted_specorde":
+        moved = restore_sorted(target_folder, target_folder.parent)
+        targed_folder_remove = 1
+        if moved:
+            q.put(("status", "Everything back in its place!"))
+        else:
+            q.put(("status", "Nothing to restore..."))
+        q.put(("status_reset", None))
+
+    elif target_folder.name == "duplicates_specorde":
+        moved = restore_duplicates(target_folder, target_folder.parent)
+        targed_folder_remove = 1
+        if moved:
+            q.put(("status", "Everything back in its place!"))
+        else:
+            q.put(("status", "Nothing to restore..."))
+        q.put(("status_reset", None))
+
+    else:
+        moved = restore_from_journal(entries)
+        duplicates_moved = restore_duplicates(duplicates, target_folder)
+        try:
+            duplicates.rmdir()
+        except OSError:
+            ()
+        if moved or duplicates_moved:
+            q.put(("status", "Everything back in its place!"))
+        else:
+            q.put(("status", "Nothing to restore..."))
+        q.put(("status_reset", None))
+
+    if moved and journal_file is not None:
+        try:
+            journal_file.rename(journal_file.with_suffix(".used"))
+        except OSError:
+            ()
+
+    if targed_folder_remove == 1:
+        try:
+            target_folder.rmdir()
+            del target_folder
+            q.put(("folder_reset", None))
+        except OSError:
+            ()
+
+
+
+
 
 def middle_reset():
     global header
@@ -750,7 +885,8 @@ def organize_open():
     execute_button.grid(row=9, column=0, padx=104,pady=24)
     footer.grid(row=10, column=0, sticky="sw", padx=14, pady=(0,4))
     file_disclaimer.grid(row=0, column=0, sticky="w", pady=2, padx=8)
-    dry_run_button.grid(row=0, column=1, sticky="e", padx=360, pady=8)
+    restore_button.grid(row=0, column=1, sticky="e", padx=(250, 60), pady=8)
+    dry_run_button.grid(row=0, column=1, sticky="e", padx=(365, 0), pady=8)
     currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
 
 def settings_open(option=0):
@@ -799,7 +935,6 @@ def pictures_open(option=0):
     middle.grid_columnconfigure(0, weight=1)
     middle.grid_rowconfigure(8, weight=1)
     header.grid(column=0, row=0, sticky="ew", pady=(0,16))
-    pictures_frame.grid(row=2, column=0, sticky="ew")
     pictures_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
     folder_browser.grid(row=0, column=1, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
     folder_chosen.grid(row=0, column=1, columnspan=2, sticky="w", pady=(24,18), padx=(304,8))
@@ -807,18 +942,16 @@ def pictures_open(option=0):
     pictures_culling.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
     pictures_size_label.grid(sticky="e", pady=8, padx=(0,95), column=2, row=1)
     pictures_size_changer.grid(sticky="se", pady=10, padx=(8,16), column=2, row=1)
-    row = 0
-    column = 0
     try:
         if option == 0:
+            culling_frame.grid_forget()
+            overview_frame.grid(row=2, column=0, sticky="ew")
             for pic in target_folder.iterdir():
-                if pic.is_file() and pic.suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff", "webp", ".bmp"]:
-                    if column == 4:
-                        row += 1
-                        column = 0
-                    column += 1
+                if pic.is_file() and pic.suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"]:
+                    ()
         elif option == 1:
-            ()
+            overview_frame.grid_forget()
+            culling_frame.grid(row=2, column=0, sticky="ew")
     except NameError:
         no_folder_chosen_error = ctk.CTkLabel(middle, text="No folder chosen yet.", font=("Bahnschrift Light Condensed", 28))
         no_folder_chosen_error.grid(row=1, pady=20)
@@ -835,10 +968,13 @@ def pictures_size():
         size=0
     if size==0:
         pictures_size_changer.configure(text="Small")
+        per_row = 6
     elif size==1:
         pictures_size_changer.configure(text="Medium")
+        per_row = 4
     else:
         pictures_size_changer.configure(text="Large")
+        per_row = 3
     #return pic_width, pic_height
 
 def resource_path(name):
@@ -855,7 +991,8 @@ ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Specorde.Specorde
 canvas = ctk.CTk()
 def log_tk_error(exc, val, tb):
     logging.error("Unhandled error", exc_info=(exc, val, tb))
-#canvas.report_callback_exception = log_tk_error
+threading.excepthook = lambda args:logging.error("Thread crashed", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+canvas.report_callback_exception = log_tk_error
 canvas.title("Specorde")
 canvas.geometry("1152x648")
 canvas.resizable(width=False, height=False)
@@ -907,7 +1044,8 @@ folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_fold
 folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14), anchor="w")
 
 #pictures
-pictures_frame = ctk.CTkScrollableFrame(middle, width=664, height=648, fg_color="#20222e")
+overview_frame = ctk.CTkScrollableFrame(middle, width=664, height=648, fg_color="#20222e")
+culling_frame = ctk.CTkScrollableFrame(middle, width=664, height=648, fg_color="#20222e")
 pictures_label = ctk.CTkLabel(header, text="Pictures", font=("Bahnschrift Light Condensed", 32))
 pictures_overview = ctk.CTkButton(header, command=lambda: pictures_change(0), text="Overview", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
 pictures_culling = ctk.CTkButton(header, command=lambda: pictures_change(1), text="Culling", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
@@ -1001,7 +1139,7 @@ def rename_pattern_changed(choice):
         settings_rename_renameby.grid_forget()
         settings_rename_renameby_text.grid_forget()
         rename_settings.configure(height=96)
-        custom_check_icon.grid(row=1, column=1, pady=8, sticky="e")
+        custom_check_icon.grid(row=1, column=2, pady=8, sticky="e", padx=(0,235))
         settings_rename_custom_text.grid(padx=(16,155), pady=8, row=1, column=0, sticky="w")
         settings_rename_custom.grid(row=1, column=2, padx=(0,16), pady=8, sticky="e")
         custom_check()
@@ -1154,7 +1292,7 @@ def dry_run_toggle():
     global execute_button
     if dry_run == 0:
         dry_run = 1
-        execute_button.configure(text_color="grey")
+        execute_button.configure(text_color="#1f2029")
         q.put(("status", "Dry run turned on."))
         logging.info("Dry run turned off.")
     else:
@@ -1175,6 +1313,7 @@ execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), fo
 footer = ctk.CTkFrame(middle, width=678, fg_color="#20222e")
 footer.columnconfigure(0, weight=0)
 file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Files that exist only in the cloud are skipped!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+restore_button = ctk.CTkButton(footer, text="Restore folder", font=("Bahnschrift Light Condensed", 11), command=lambda: start_execute(start_restoring), width=76, height=24)
 dry_run_button = ctk.CTkButton(footer, text="Dry run", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
 
 #show tutorial
