@@ -8,11 +8,14 @@ import hashlib
 import os
 import sys
 import customtkinter as ctk
+import time
+from logging.handlers import RotatingFileHandler
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk, ExifTags
+from PIL import Image, ImageTk
 import json
 import threading
 import logging
+from collections import Counter
 import queue
 from send2trash import send2trash
 import ctypes
@@ -22,41 +25,38 @@ app_version = "1.0.1.0"
 
 #Developer settings
 month_dict = {
-    1: "(1) January", 2: "(2) February", 3: "(3) March", 4: "(4) April", 5: "(5) May", 6: "(6) June", 7: "(7) July", 8: "(8) August", 9: "(9) September", 10: "(10) October", 11: "(11) November", 12: "(12) December"
+    1: "01 January", 2: "02 February", 3: "03 March", 4: "04 April", 5: "05 May", 6: "06 June", 7: "07 July", 8: "08 August", 9: "09 September", 10: "10 October", 11: "11 November", 12: "12 December"
 }
-years_used = []
 suffix = [
     "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)", "(16)", "(17)", "(18)", "(19)", "(20)", "- Copy"
 ]
 q = queue.Queue()
 cfg = {}
 check = 1
-path = Path(os.getenv("APPDATA")) / "Specorde"
+path = Path(os.getenv("APPDATA") or Path.home()) / "Specorde"
 path.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(filename=path / "specorde.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logging.info("Specorde started")
+log_handler = RotatingFileHandler(path / "specorde.log", maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S"))
+logging.basicConfig(level=logging.INFO, handlers=[log_handler])
+logging.info("Specorde %s started", app_version)
+def log_crash(exc, val, tb):
+    logging.critical("Crashed", exc_info=(exc, val, tb))
+sys.excepthook = log_crash
 memory = path / "memory.json"
 journal_path = path / "journals"
 journal_name = None
 size = 0
 dry_run = 0
 
+tutorial_seen = 0
 try:
-    with open(memory, "r") as f:
+    with open(memory, "r", encoding="utf-8") as f:
         tutorial_seen = json.load(f)
 except FileNotFoundError:
-    logging.info("File not found, building a new one...")
-    memory = Path(memory)
-    memory.touch(exist_ok=True)
-    with open(memory, "w") as f:
-        json.dump(0, f)
-    tutorial_seen = 0
-except json.JSONDecodeError:
-    logging.warning("memory.json was empty, starting fresh")
-    memory = Path(memory)
-    memory.touch(exist_ok=True)
-    with open(memory, "w") as f:
-        json.dump(0, f)
+    logging.info("memory.json not found, starting fresh")
+except (OSError, json.JSONDecodeError):
+    logging.warning("memory.json unreadable, starting fresh")
+if tutorial_seen not in (0, 1):
     tutorial_seen = 0
 
 if tutorial_seen == 0:
@@ -72,26 +72,29 @@ def start_execute(task):
 def run_execute():
     global cfg
     if "target_folder" not in globals():
-        q.put(("status", "You must pick a folder."))
+        q.put(("status", "You must pick a folder"))
         q.put(("status_reset", None))
         return
     
     if not (actions_find.get() or actions_sort.get() or actions_rename.get()):
-        q.put(("status", "Tick at least one function."))
+        q.put(("status", "Tick at least one function"))
         q.put(("status_reset", None))
         return
-    if actions_rename.get() and settings_rename_pattern.get() == "custom name + number" and check == 0:
-        messagebox.showwarning("Specorde", "Your custom name is not valid. Check it in Settings.")
-        return
+    if actions_rename.get() and settings_rename_pattern.get() == "custom name + number":
+        custom_check()
+        if check == 0:
+            messagebox.showwarning("Specorde", "Your custom name is not valid. Check it in Settings")
+            return
     if not target_folder.is_dir():
-        messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again.")
+        messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again")
         return
-    count = sum(1 for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f))
-    message = f"This will change files in '{target_folder.name}' ({count} files)."
-    if actions_find.get() and settings_duplicate_delete.get() == "Deleted":
-        message += "\n\nDuplicates will be sent to the Recycle Bin. On USB or network drives they may be deleted permanently."
-    if not messagebox.askyesno("Specorde", message + "\n\nContinue?"):
-        return
+    if not dry_run:
+        count = sum(1 for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f))
+        message = f"This will change files in '{target_folder.name}' ({count} files)"
+        if actions_find.get() and settings_duplicate_delete.get() == "Deleted":
+            message += "\n\nDuplicates will be sent to the Recycle Bin. On USB or network drives they may be deleted permanently"
+        if not messagebox.askyesno("Specorde", message + "\n\nContinue?"):
+            return
     cfg = {
         "find": actions_find.get(),
         "water": actions_water.get(),
@@ -104,9 +107,53 @@ def run_execute():
         "renameby": settings_rename_renameby.get(),
         "custom": settings_rename_custom.get("1.0", "end-1c"),
     }
+    execute_button.configure(state="disabled")
     q.put(("lock", None))
     start_execute(execute)
 reset_job = None
+SUMMARY_COLOR = "#c8ccd8"
+PANEL_COLOR = "#1f2029"
+FADE_STEPS = 10
+PREVIEW_LIMIT = 150
+preview_count = 0
+
+def mix(c1, c2, t):
+    a = [int(c1[i:i+2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i+2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+SUMMARY_LINE_TIME = 850
+summary_labels = []
+summary_jobs = []
+
+def summary_clear():
+    for job in summary_jobs:
+        canvas.after_cancel(job)
+    summary_jobs.clear()
+    for label in summary_labels:
+        label.destroy()
+    summary_labels.clear()
+    bar_summary.grid_forget()
+
+def summary_add(line):
+    label = ctk.CTkLabel(bar_summary, text=line, text_color=SUMMARY_COLOR, font=("Bahnschrift Light Condensed", 15), justify="left", anchor="w", wraplength=200)
+    summary_labels.append(label)
+    for row, item in enumerate(reversed(summary_labels)):
+        item.grid(row=row, column=0, sticky="w")
+    bar_summary.grid(row=5, column=0, sticky="nw", padx=20, pady=5)
+
+def summary_fade(label, step=0):
+    if step > FADE_STEPS:
+        return
+    label.configure(text_color=mix(SUMMARY_COLOR, PANEL_COLOR, step / FADE_STEPS))
+    summary_jobs.append(canvas.after(40, lambda: summary_fade(label, step + 1)))
+
+def summary_hide_later():
+    for position, label in enumerate(summary_labels, start=1):
+        summary_jobs.append(canvas.after(SUMMARY_LINE_TIME * position, lambda l=label: summary_fade(l)))
+    end = SUMMARY_LINE_TIME * len(summary_labels) + FADE_STEPS * 40 + 100
+    summary_jobs.append(canvas.after(end, summary_clear))
+
 def check_messages():
     global reset_job
     try:
@@ -126,13 +173,20 @@ def check_messages():
             elif kind == "bar_set":
                 bar.set(value)
             elif kind == "bar_show":
-                bar.grid(row=3, padx=25, sticky="w", pady=(8,2))
+                bar.grid(row=0, column=0, padx=25, sticky="w", pady=(8,2))
+                bar.set(0)
             elif kind == "bar_text_show":
-                bar_text.grid(row=4, padx=32, sticky="w")
+                bar_text.grid(row=1, column=0, padx=32, sticky="w")
             elif kind == "bar_hide":
                 bar.grid_forget()
             elif kind == "bar_text_hide":
                 bar_text.grid_forget()
+            elif kind == "summary_clear":
+                summary_clear()
+            elif kind == "summary_add":
+                summary_add(value)
+            elif kind == "summary_hide_later":
+                summary_hide_later()
             elif kind == "status_reset":
                 if reset_job is not None:
                     canvas.after_cancel(reset_job)
@@ -151,7 +205,7 @@ def check_messages():
                 folder_browser.configure(text="Choose a new folder")
                 folder_chosen.configure(text="Folder chosen:")
     except queue.Empty: pass
-    canvas.after(20, check_messages)
+    finally: canvas.after(20, check_messages)
 
 def parse_exif_date(text):
     try:
@@ -159,17 +213,66 @@ def parse_exif_date(text):
     except ValueError:
         return None
 
+def mark():
+    return "○ " if dry_run else "✓ "
+
+def result(count, thing, verb, failed=0):
+    """One summary line: '✓ 3 duplicates moved' or '○ 3 duplicates would be moved'"""
+    n = f"{count} {thing}" + ("" if count == 1 else "s")
+    text = f"{n} would be {verb}" if dry_run else f"{n} {verb}"
+    if failed:
+        text += f" ({failed} failed)"
+    return mark() + text
+
+def short(p):
+    try:
+        return str(Path(p).relative_to(target_folder))
+    except ValueError:
+        return str(p)
+
+def log_preview(text):
+    global preview_count
+    preview_count += 1
+    if preview_count <= PREVIEW_LIMIT:
+        logging.info("[PREVIEW] %s", text)
+    elif preview_count == PREVIEW_LIMIT + 1:
+        logging.info("[PREVIEW] ... more not listed (the summary has the full count)")
+
 def safe_rename(item, destination):
+    if dry_run:
+        log_preview(f"{item.name}  ->  {short(destination)}")
+        return True
     try:
         item.rename(destination)
-        note = {"from": str(item), "to": str(destination)}
+    except OSError:
+        logging.exception("Could not move or rename %s", item.name)
+        return False
+    logging.debug("Moved %s -> %s", item.name, short(destination))
+    try:
         if not journal_name.exists():
             with open(journal_name, "w") as f:
                 f.write(json.dumps({"folder": str(target_folder)}) + "\n")
         with open(journal_name, "a") as f:
-            f.write(json.dumps(note) + "\n")
+            f.write(json.dumps({"from": str(item), "to": str(destination)}) + "\n")
     except OSError:
-        logging.exception("Could not move or rename %s", item.name)
+        logging.exception("Moved %s but could not write it to the journal", item.name)
+    return True
+
+def remove_duplicate(file, mode):
+    if mode == "Moved to a folder":
+        if not dry_run:
+            duplicates.mkdir(exist_ok=True)
+        destination = duplicates / file.name
+        counter = 1
+        while destination.exists():
+            destination = duplicates / f"{file.stem}_{counter}{file.suffix}"
+            counter += 1
+        return safe_rename(file, destination)
+    if dry_run:
+        log_preview(f"{file.name}  ->  Recycle Bin")
+        return True
+    send2trash(str(file))
+    return True
 
 def find_last_run():
     try:
@@ -207,315 +310,183 @@ def get_exif(path):
     return None
 
 
+def get_file_date(item, mode):
+    if mode == "Date taken":
+        if item.suffix.lower() in exif_suffix:
+            exif_string = get_exif(item)
+            photo_date = parse_exif_date(exif_string) if exif_string else None
+            if photo_date:
+                return photo_date
+            logging.warning("No date taken for %s, using date modified instead", item.name)
+        else:
+            logging.debug("%s has an unsupported suffix, using date modified", item.name)
+    return datetime.fromtimestamp(item.stat().st_mtime)
+
+last_progress = 0.0
+
+def progress(label, done, total):
+    global last_progress
+    now = time.perf_counter()
+    if now - last_progress < 0.1:
+        return
+    last_progress = now
+    percent = min(done / total * 100, 100)
+    q.put(("status", "Almost there!" if percent > 80 else label))
+    q.put(("bar_text", f"{percent:.2f}%"))
+    q.put(("bar_set", percent / 100))
+
+
 def sort():
-    global bar_text
-    global status
-    global bar
-    try:
-        done = 0
-        q.put(("bar_set", 0))
-        for item in list(target_folder.iterdir()):
-            q.put(("bar_show", None))
-            q.put(("bar_text_show", None))
+    files = list_files(target_folder)
+    if not files:
+        return mark() + "No files to sort"
+    total = sum(s for _, s in files) or 1
+    done = 0
+    sorted_count = 0
+    failed = 0
+    q.put(("bar_set", 0))
 
-            try:
-                if item.is_file() and not is_protected_item(item):
-                    done = done + item.stat().st_size / (1024*1024*1024)
+    for item, item_size in files:
+        done += item_size
+        progress("Sorting...", done, total)
 
-                    if cfg["sortby"] == "Date modified":
-                        file_time = datetime.fromtimestamp(item.stat().st_mtime)
-                        year = str(file_time.year)
-                        month = month_dict[file_time.month]
-                        day = str(file_time.day)
-                    elif cfg["sortby"] == "Date taken":
+        try:
+            file_time = get_file_date(item, cfg["sortby"])
+            month_dir = sorted_dir / str(file_time.year) / month_dict[file_time.month]
+            if cfg["structure"] == "year/month/day":
+                destination_dir = month_dir / f"{file_time.day:02d}"
+            else:
+                destination_dir = month_dir
+            if not dry_run:
+                destination_dir.mkdir(parents=True, exist_ok=True)
 
-                        if item.suffix.lower() not in exif_suffix:
-                            file_time = datetime.fromtimestamp(item.stat().st_mtime)
-                            year = str(file_time.year)
-                            month = month_dict[file_time.month]
-                            day = str(file_time.day)
-                            logging.debug("%s has an unsupported suffix, using date modified", item.name)
-                        else:
-                            exif_string = get_exif(item)
-                            photo_date = parse_exif_date(exif_string) if exif_string else None
-                            if photo_date:
-                                year = str(photo_date.year)
-                                month = month_dict[photo_date.month]
-                                day = str(photo_date.day)
-                            else:
-                                file_time = datetime.fromtimestamp(item.stat().st_mtime)
-                                year = str(file_time.year)
-                                month = month_dict[file_time.month]
-                                day = str(file_time.day)
-                                logging.warning(f"No date taken for {item.name}, sorted by date modified instead")
+            destination = destination_dir / item.name
+            counter = 1
+            while destination.exists():
+                destination = destination_dir / f"{item.stem}_{counter}{item.suffix}"
+                counter += 1
+            if safe_rename(item, destination):
+                sorted_count += 1
+            else:
+                failed += 1
+        except Exception:
+            logging.exception("Could not sort %s", item.name)
+            failed += 1
 
-                    sorted_dir.mkdir(exist_ok=True)
-                    year_dir = sorted_dir / year
-                    year_dir.mkdir(exist_ok=True)
-                    month_dir = year_dir / month
-                    month_dir.mkdir(exist_ok=True)
-                    years_used.append(year)
+    q.put(("bar_set", 1))
+    q.put(("bar_text", "100%"))
+    return result(sorted_count, "file", "sorted", failed)
 
-                    if cfg["structure"] == "year/month":
-                        destination = Path(month_dir/item.name)
-
-                        if destination.exists():
-                            counter = 1
-                            while destination.exists():
-                                destination = Path(month_dir/f"{item.stem}_{counter}{item.suffix}")
-                                counter += 1
-                        safe_rename(item, destination)
-
-                    elif cfg["structure"] == "year/month/day":
-                        day_dir = month_dir / day
-                        day_dir.mkdir(exist_ok=True)
-                        destination = Path(day_dir/item.name)
-
-                        if destination.exists():
-                            counter = 1
-                            while destination.exists():
-                                destination = Path(day_dir/f"{item.stem}_{counter}{item.suffix}")
-                                counter += 1
-                        safe_rename(item, destination)
-
-                    try:
-                        percent = done / folder_size * 100
-                        if percent > 80:
-                            q.put(("status", "Almost there!"))
-                        else:
-                            q.put(("status", "Sorting..."))
-                        q.put(("bar_text", f"{percent :.2f}%"))
-                        q.put(("bar_set", percent/100))
-
-                    except ZeroDivisionError: pass
-            except Exception:
-                logging.exception("Could not sort %s", item.name)
-
-        q.put(("bar_text", "100%"))
-        q.put(("status", "Files sorted!"))
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-        logging.info("Files sorted.")
-    except NameError:
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-        q.put(("status", "You must pick a folder."))
-        q.put(("status_reset", None))
-    except FileNotFoundError:
-        logging.exception("File not found")
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-    q.put(("status_reset", None))
-
-def is_copy(file):
-    return any(suf in file.stem for suf in suffix)
-
-def remove_duplicate(file, mode):
-    if mode == "Moved to a folder":
-        destination = duplicates / file.name
-        counter = 1
-        while destination.exists():
-            destination = duplicates / f"{file.stem}_{counter}{file.suffix}"
-            counter += 1
-        safe_rename(file, destination)
-    elif mode == "Deleted":
-        send2trash(str(file))
 
 def duplicate_finder():
-    try:
-        changed = 0
-        seen = {}
-        mode = cfg["duplicate_mode"]
+    mode = cfg["duplicate_mode"]
+    files = sorted(list_files(target_folder), key=lambda t: t[0].name.lower())
+    sizes = Counter(s for _, s in files)
+    total = sum(s for _, s in files) or 1
+    done = 0
+    seen = {}
+    removed = 0
+    failed = 0
+    q.put(("bar_set", 0))
 
-        files = list_files(target_folder)
-        total = sum(s for _, s in files) or 1   # never 0
-        done = 0
+    for item, item_size in files:
+        done += item_size
+        progress("Finding duplicates", done, total)
 
-        q.put(("bar_set", 0))
-        q.put(("bar_show", None))
-        q.put(("bar_text_show", None))
+        if item_size == 0 or sizes[item_size] < 2:
+            continue
+        try:
+            file_hash = get_hash(item)
+        except OSError:
+            logging.exception("Could not read %s", item.name)
+            failed += 1
+            continue
 
-        for item, item_size in files:
-            done += item_size
-            percent = min(done / total * 100, 100)
-            q.put(("status", "Almost there!" if percent > 80 else "Finding duplicates"))
-            q.put(("bar_text", f"{percent:.2f}%"))
-            q.put(("bar_set", percent / 100))
+        if file_hash not in seen:
+            seen[file_hash] = item
+            continue
+        try:
+            if is_copy(seen[file_hash]) and not is_copy(item):
+                ok = remove_duplicate(seen[file_hash], mode)
+                seen[file_hash] = item
+            else:
+                ok = remove_duplicate(item, mode)
+            if ok:
+                removed += 1
+            else:
+                failed += 1
+        except Exception:
+            logging.exception("Could not remove duplicate %s", item.name)
+            failed += 1
 
-            if item_size == 0: continue
-            try:
-                file_hash = get_hash(item)
-            except OSError:
-                logging.exception("Could not read %s", item.name)
+    q.put(("bar_set", 1))
+    q.put(("bar_text", "100%"))
+    if removed == 0 and failed == 0:
+        old = mode == "Moved to a folder" and duplicates.exists() and any(duplicates.iterdir())
+        return mark() + ("No new duplicates found" if old else "No duplicates found")
+    verb = "moved" if mode == "Moved to a folder" else "removed"
+    return result(removed, "duplicate", verb, failed)
+
+
+def rename():
+    if check == 0:
+        return "✗ Custom name is not valid"
+    choice = cfg["pattern"]
+    renameby = cfg["renameby"]
+    custom = cfg["custom"]
+
+    files = sorted(list_files(target_folder), key=lambda t: t[0].name.lower())
+    if not files:
+        return mark() + "No files to rename"
+    total = sum(s for _, s in files) or 1
+    done = 0
+    width = len(str(len(files)))
+    renamed = 0
+    failed = 0
+    q.put(("bar_set", 0))
+
+    for number, (item, item_size) in enumerate(files, start=1):
+        done += item_size
+        progress("Renaming the files", done, total)
+        try:
+            number_text = str(number).zfill(width)
+            if choice == "date + number":
+                file_time = get_file_date(item, renameby)
+                base = f"{file_time.year}-{file_time.month:02d}-{file_time.day:02d}_{number_text}"
+            elif choice == "original name + number":
+                base = f"{item.stem}_{number_text}"
+            elif choice == "custom name + number":
+                base = f"{custom}_{number_text}"
+            else:
                 continue
 
-            if file_hash in seen:
-                if mode == "Moved to a folder":
-                    duplicates.mkdir(exist_ok=True)
-                try:
-                    if is_copy(seen[file_hash]) and not is_copy(item):
-                        remove_duplicate(seen[file_hash], mode)
-                        seen[file_hash] = item
-                    else:
-                        remove_duplicate(item, mode)
-                    changed = 1
-                except Exception:
-                    logging.exception("Could not remove duplicate %s", item.name)
+            destination = target_folder / f"{base}{item.suffix}"
+            if destination == item:
+                continue
+            counter = 0
+            while destination.exists():
+                counter += 1
+                destination = target_folder / f"{base}_{counter}{item.suffix}"
+            if safe_rename(item, destination):
+                renamed += 1
             else:
-                seen[file_hash] = item
+                failed += 1
+        except Exception:
+            logging.exception("Could not rename %s", item.name)
+            failed += 1
 
-        if mode == "Moved to a folder":
-            if not duplicates.exists() or not any(duplicates.iterdir()):
-                result = "No duplicates found!"
-            elif changed == 0:
-                result = "No new duplicates!"
-            else:
-                result = "All duplicates found!"
-        else:
-            result = "Duplicates removed!" if changed else "No duplicates found!"
-
-        q.put(("bar_set", 1))
-        q.put(("bar_text", "100%"))
-        q.put(("status", result))
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-    except NameError:
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-        q.put(("status", "You must pick a folder."))
-    except FileNotFoundError:
-        logging.exception("Duplicate finder: file not found")
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-    except PermissionError:
-        logging.exception("Duplicate finder: permission denied")
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-    q.put(("status_reset", None))
+    q.put(("bar_set", 1))
+    q.put(("bar_text", "100%"))
+    return result(renamed, "file", "renamed", failed)
+    
+def is_copy(file):
+    return any(suf in file.stem for suf in suffix)
 
 def watermark():
     try:
         ()
     except NameError:
-        q.put(("status", "You must pick a folder."))
-
-def rename():
-    global bar
-    global bar_text
-    global status
-    if check == 0:
-        q.put(("status", "Your custom name is not valid."))
-        q.put(("status_reset", None))
-        return
-    q.put(("bar_set", 0))
-    q.put(("bar_show", None))
-    q.put(("bar_text_show", None))
-    size = 0
-    choice = cfg["pattern"]
-    renameby = cfg["renameby"]
-    custom = cfg["custom"]
-    number = 0
-    try:
-        files = [f for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f)]
-        count = len(files)
-        width = len(str(count))
-        for item in files:
-            counter = 0
-            if item.is_file():
-                try:
-                    size = size + item.stat().st_size / (1024*1024*1024)
-                except FileNotFoundError:
-                    logging.warning(f"File {item.name} not found")
-                number += 1
-                number_text = str(number).zfill(width)
-
-                try:
-                    percent = size / folder_size * 100
-                    if percent > 80:
-                        q.put(("status", "Almost there!"))
-                    else:
-                        q.put(("status", "Renaming the files"))
-                    q.put(("bar_text", f"{percent :.2f}%"))
-                    q.put(("bar_set", percent/100))
-                except ZeroDivisionError: pass
-                                    
-                if choice == "date + number":
-                    if renameby == "Date modified":
-                        file_time = datetime.fromtimestamp(item.stat().st_mtime)
-                        year = str(file_time.year)
-                        month = str(file_time.month).zfill(2)
-                        day = str(file_time.day).zfill(2)
-
-                        destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}{item.suffix}")
-                        if destination.exists():
-                            while destination.exists():
-                                counter += 1
-                                destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}_{counter}{item.suffix}")
-                        safe_rename(item, destination)
-
-                    elif renameby == "Date taken":
-                        if item.suffix.lower() not in exif_suffix:
-                            file_time = datetime.fromtimestamp(item.stat().st_mtime)
-                            year = str(file_time.year)
-                            month = str(file_time.month).zfill(2)
-                            day = str(file_time.day).zfill(2)
-                            logging.debug("%s has an unsupported suffix, using date modified", item.name)
-                        else:
-                            exif_string = get_exif(item)
-                            photo_date = parse_exif_date(exif_string) if exif_string else None
-                            if photo_date:
-                                year = str(photo_date.year)
-                                month = str(photo_date.month).zfill(2)
-                                day = str(photo_date.day).zfill(2)
-                            else:
-                                file_time = datetime.fromtimestamp(item.stat().st_mtime)
-                                year = str(file_time.year)
-                                month = str(file_time.month).zfill(2)
-                                day = str(file_time.day).zfill(2)
-                                logging.warning(f"No date taken for {item.name}, renamed by date modified instead")
-
-                        destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}{item.suffix}")
-                        if destination.exists():
-                            while destination.exists():
-                                counter += 1
-                                destination = Path(f"{target_folder}/{year}-{month}-{day}_{number_text}_{counter}{item.suffix}")
-                        safe_rename(item, destination)
-                elif choice == "original name + number":
-                    destination = Path(f"{target_folder}/{item.stem}_{number_text}{item.suffix}")
-                    if destination.exists():
-                        while destination.exists():
-                            counter += 1
-                            destination = Path(f"{target_folder}/{item.stem}_{number_text}_{counter}{item.suffix}")
-                    safe_rename(item, destination)
-
-                elif choice == "custom name + number":
-                    destination = Path(f"{target_folder}/{custom}_{number_text}{item.suffix}")
-                    if destination.exists():
-                        while destination.exists():
-                            counter += 1
-                            destination = Path(f"{target_folder}/{custom}_{number_text}_{counter}{item.suffix}")
-                    safe_rename(item, destination)
-                
-            else:
-                try:
-                    size = size + sum(f.stat().st_size for f in item.rglob("*")) / (1024*1024*1024)
-                except FileNotFoundError:
-                    logging.warning(f"File {item.name} not found")
-        q.put(("bar_text", "100%"))
-        q.put(("status", "Files renamed!"))
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-        logging.info("Files renamed.")
-    except NameError:
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-        q.put(("status", "You must pick a folder."))
-        q.put(("status_reset", None))
-    except FileNotFoundError:
-        logging.exception("File not found")
-        q.put(("bar_text_destroy", None))
-        q.put(("bar_destroy", None))
-    q.put(("status_reset", None))
+        q.put(("status", "You must pick a folder"))
 
 PROTECTED_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", "ntuser.dat", "pagefile.sys", "hiberfil.sys", "swapfile.sys"}
 PROTECTED_SUFFIXES = {".sys", ".dll", ".drv", ".ini", ".exe", ".msi", ".lnk", ".bat", ".cmd", ".reg"}
@@ -561,25 +532,9 @@ def is_dangerous(folder):
             return True
     return False
 
-def measure_folder(folder):
-    global folder_size
-    total = 0
-    try:
-        for f in folder.rglob("*"):
-            if f not in ["sorted_specorde", "duplicates_specorde"]:
-                try:
-                    total += f.stat().st_size
-                except OSError: pass
-    except Exception:
-        logging.exception("Could not measure %s", folder.name)
-    folder_size = total / (1024*1024*1024)
-    q.put(("status", "Folder ready!"))
-    q.put(("status_reset", None))
-    q.put(("unlock", None))
 
 def pick_folder():
     global target_folder
-    global folder_size
     global duplicates
     global sorted_dir
 
@@ -587,7 +542,7 @@ def pick_folder():
     if not chosen:
         return
     if is_dangerous(Path(chosen)):
-        messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder.")
+        messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder")
         return
     target_folder = Path(chosen)
     folder_browser.configure(text="Choose a different folder")
@@ -604,10 +559,10 @@ def pick_folder():
 
     sorted_dir = Path(target_folder/"sorted_specorde")
     duplicates = Path(target_folder/"duplicates_specorde")
-    folder_size = 0
-    q.put(("lock", None))
-    q.put(("status", "Reading folder..."))
-    threading.Thread(target=measure_folder, args=(target_folder,), daemon=True).start()
+    q.put(("status", "Folder ready!"))
+    q.put(("status_reset", None))
+    q.put(("unlock", None))
+    
 
 allowed_characters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "_", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
 def get_hash(filepath:  Path):
@@ -618,50 +573,74 @@ def get_hash(filepath:  Path):
     return hasher.hexdigest()
 
 def execute():
-    global journal_name
+    global journal_name, preview_count
     q.put(("lock", None))
+    q.put(("summary_clear", None))
+    started = time.perf_counter()
+    preview_count = 0
+    final_status = "Preview done! See log..." if dry_run else "Done!"
     try:
-        journal_path.mkdir(exist_ok=True)
+        if not dry_run:
+            journal_path.mkdir(exist_ok=True)
         journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
-        if dry_run == 0:
-            logging.info("Run started on '%s'", target_folder.name)
-            if cfg["find"]:
-                logging.info("Finding duplicates (%s)...", cfg["duplicate_mode"])
-                duplicate_finder()
-            if cfg["rename"]:
-                rename_detail = cfg["pattern"]
-                if rename_detail == "date + number":
-                    rename_detail = f"{rename_detail}, by {cfg['renameby']}"
-                elif rename_detail == "custom name + number":
-                    rename_detail = f"{rename_detail}, name '{cfg['custom']}'"
-                logging.info("Renaming files (%s)...", rename_detail)
-                rename()
-            if cfg["sort"]:
-                logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
-                sort()
-        elif dry_run == 1:
-            q.put(("status", "Check log."))
-            if cfg["find"]:
-                logging.info("Finding duplicates (%s)...", cfg["duplicate_mode"])
-            if cfg["rename"]:
-                rename_detail = cfg["pattern"]
-                if rename_detail == "date + number":
-                    rename_detail = f"{rename_detail}, by {cfg['renameby']}"
-                elif rename_detail == "custom name + number":
-                    rename_detail = f"{rename_detail}, name '{cfg['custom']}'"
-                logging.info("Renaming files (%s)...", rename_detail)
-            if cfg["sort"]:
-                logging.info("Sorting (by %s, structure %s)...", cfg["sortby"], cfg["structure"])
-            q.put(("status_reset", None))
+
+        logging.info("=" * 60)
+        logging.info("RUN%s  %s  folder: %s", "  [PREVIEW]" if dry_run else "", datetime.now().strftime("%Y-%m-%d %H:%M"), target_folder)
+
+        steps = []
+        if cfg["find"]:
+            logging.info("  find duplicates -> %s", cfg["duplicate_mode"].lower())
+            steps.append(("Find duplicates", duplicate_finder))
+        if cfg["rename"]:
+            detail = cfg["pattern"]
+            if detail == "date + number":
+                detail += f", by {cfg['renameby'].lower()}"
+            elif detail == "custom name + number":
+                detail += f", name '{cfg['custom']}'"
+            logging.info("  rename -> %s", detail)
+            steps.append(("Rename", rename))
+        if cfg["sort"]:
+            logging.info("  sort -> by %s, %s", cfg["sortby"].lower(), cfg["structure"])
+            steps.append(("Sort", sort))
+
+        q.put(("bar_show", None))
+        q.put(("bar_text_show", None))
+        for label, step in steps:
+            step_started = time.perf_counter()
+            try:
+                line = step()
+            except Exception:
+                logging.exception("%s failed", label)
+                line = f"✗ {label} failed (see log)"
+            q.put(("summary_add", line))
+            logging.info("%s: %s  (%.1f s)", label, line[2:], time.perf_counter() - step_started)
     except Exception:
         logging.exception("Error trying to execute")
+        final_status = "Something went wrong. See log..."
+    finally:
+        logging.info("Run finished in %.1f s", time.perf_counter() - started)
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
-        q.put(("status", "Something went wrong. See log."))
+        q.put(("status", final_status))
         q.put(("status_reset", None))
+        q.put(("summary_hide_later", None))
         q.put(("unlock", None))
-    finally:
-        q.put(("unlock", None))
+
+restore_stats = {"done": 0, "failed": 0, "total": 1}
+
+def restore_tick():
+    restore_stats["done"] += 1
+    progress("Restoring...", restore_stats["done"], restore_stats["total"])
+    return 1
+
+def restore_line(count, failed):
+    if not count and not failed:
+        return "○ Nothing to restore"
+    n = f"{count} change" + ("" if count == 1 else "s")
+    text = f"{n} undone"
+    if failed:
+        text += f" ({failed} failed)"
+    return ("✗ " if failed and not count else "✓ ") + text
 
 def restore_duplicates(source, dest):
     moved = 0
@@ -675,9 +654,10 @@ def restore_duplicates(source, dest):
                     destination = Path(f"{dest}/{item.stem}_restored_{counter}{item.suffix}")
                 try:
                     item.rename(destination)
-                    moved = 1
+                    moved += restore_tick()
                 except OSError:
                     logging.error("Could not restore %s", item.name)
+                    restore_stats["failed"] += 1
     return moved
 
 def restore_sorted(source, dest):
@@ -697,11 +677,13 @@ def restore_sorted(source, dest):
                         destination = Path(f"{dest}/{month_sub.stem}_restored_{counter}{month_sub.suffix}")
                     try:
                         month_sub.rename(destination)
-                        moved = 1
+                        moved += restore_tick()
                     except OSError:
                         logging.error("Could not restore %s", month_sub.name)
-                else:
+                        restore_stats["failed"] += 1
+                elif month_sub.name.isdigit():
                     for item in list(month_sub.iterdir()):
+                        if not item.is_file(): continue
                         counter = 0
                         destination = dest/item.name
                         while destination.exists():
@@ -709,9 +691,10 @@ def restore_sorted(source, dest):
                             destination = Path(f"{dest}/{item.stem}_restored_{counter}{item.suffix}")
                         try:
                             item.rename(destination)
-                            moved = 1
+                            moved += restore_tick()
                         except OSError:
                             logging.error("Could not restore %s", item.name)
+                            restore_stats["failed"] += 1
                     try:
                         month_sub.rmdir()
                     except OSError: pass
@@ -738,30 +721,36 @@ def restore_from_journal(entries):
                         counter += 1
                         destination = Path(f"{original.parent}/{original.stem}_restored_{counter}{original.suffix}")
                     moved_to.rename(destination)
-                    moved = 1
+                    moved += restore_tick()
+                    parent = moved_to.parent
+                    while parent != target_folder and target_folder in parent.parents:
+                        try: parent.rmdir()
+                        except OSError: break
+                        parent = parent.parent
                 except OSError:
-                    logging.exception("Could not restore %s", moved_to.name)
-        if sorted_dir.exists():
+                    logging.error("Could not restore %s", moved_to.name)
+                    restore_stats["failed"] += 1
+        if not entries and sorted_dir.exists():
             moved_sort = restore_sorted(sorted_dir, target_folder)
             try:
                 sorted_dir.rmdir()
             except OSError: pass
-        if moved_sort:
-            moved = 1
+        moved += moved_sort
         return moved
 
 def start_restoring():
     global target_folder
     entries = []
     moved = 0
+    duplicates_moved = 0
     targed_folder_remove = 0
     if "target_folder" not in globals():
-        q.put(("status", "You must pick a folder."))
+        q.put(("status", "You must pick a folder"))
         q.put(("status_reset", None))
         return
     q.put(("lock", None))
     try:
-        
+
         journal_file = find_last_run()
         if journal_file is None:
             if not duplicates.exists() and not sorted_dir.exists():
@@ -784,6 +773,16 @@ def start_restoring():
                         entries.append(item)
                     except json.JSONDecodeError: continue
 
+        logging.info("RESTORE  folder: %s", target_folder)
+        restore_stats.update(done=0, failed=0, total=1)
+        if target_folder.name in ("sorted_specorde", "duplicates_specorde"):
+            restore_stats["total"] = max(sum(1 for p in target_folder.rglob("*") if p.is_file()), 1)
+        else:
+            restore_stats["total"] = max(len(entries), 1)
+        q.put(("summary_clear", None))
+        q.put(("bar_show", None))
+        q.put(("bar_text_show", None))
+
         if target_folder.name == "sorted_specorde":
             moved = restore_sorted(target_folder, target_folder.parent)
             targed_folder_remove = 1
@@ -804,7 +803,7 @@ def start_restoring():
 
         else:
             moved = restore_from_journal(entries)
-            duplicates_moved = restore_duplicates(duplicates, target_folder)
+            duplicates_moved = 0 if entries else restore_duplicates(duplicates, target_folder)
             try:
                 duplicates.rmdir()
             except OSError: pass
@@ -814,7 +813,18 @@ def start_restoring():
                 q.put(("status", "Nothing to restore..."))
             q.put(("status_reset", None))
 
-        if journal_file is not None:
+        total_moved = moved + duplicates_moved
+        failed = restore_stats["failed"]
+        logging.info("Restore finished: %d undone, %d failed", total_moved, failed)
+        q.put(("bar_set", 1))
+        q.put(("bar_text", "100%"))
+        if failed:
+            q.put(("status", "Restored with errors. See log."))
+            q.put(("status_reset", None))
+        q.put(("summary_add", restore_line(total_moved, failed)))
+        q.put(("summary_hide_later", None))
+
+        if journal_file is not None and not failed:
             try:
                 journal_file.rename(journal_file.with_suffix(".used"))
             except OSError: pass
@@ -825,8 +835,24 @@ def start_restoring():
                 del target_folder
                 q.put(("folder_reset", None))
             except OSError: pass
+    except Exception:
+        logging.exception("Restore failed")
+        q.put(("status", "Restore failed. See log."))
+        q.put(("status_reset", None))
     finally:
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
         q.put(("unlock", None))
+
+def restore_click():
+    if "target_folder" not in globals():
+        q.put(("status", "You must pick a folder."))
+        q.put(("status_reset", None))
+        return
+    if not messagebox.askyesno("Specorde", f"Put the files in '{target_folder.name}' back where they were before the last run?\n\nFiles sent to the Recycle Bin can't be restored by Specorde.\n\nContinue?"):
+        return
+    restore_button.configure(state="disabled")
+    start_execute(start_restoring)
 
 def middle_reset():
     global header
@@ -972,6 +998,12 @@ canvas.report_callback_exception = log_tk_error
 canvas.title("Specorde")
 canvas.geometry("1152x648")
 canvas.resizable(width=False, height=False)
+def on_close():
+    if execute_button.cget("state") == "disabled" and not messagebox.askyesno("Specorde", "A task is still running. Quit anyway?\n\nFiles already moved can be put back with 'Restore folder'."):
+        return
+    canvas.destroy()
+
+canvas.protocol("WM_DELETE_WINDOW", on_close)
 try:
     logo = ImageTk.PhotoImage(Image.open(str(resource_path("specorde_logo.ico"))))
     canvas.after(500, lambda: canvas.iconbitmap(str(resource_path("specorde_logo.ico"))))
@@ -1034,19 +1066,19 @@ tutorial_frame = ctk.CTkFrame(middle, fg_color="transparent")
 tutorial_frame.grid_columnconfigure(0, weight=1)
  
 tutorial_intro_title = ctk.CTkLabel(tutorial_frame, text="Welcome to Specorde", font=("Bahnschrift Light Condensed", 22))
-tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick what you want done and press Execute. Your progress shows in the Activity panel on the right.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
+tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick what you want done and press Execute. Your progress shows in the Activity panel on the right", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
  
 tutorial_functions_title = ctk.CTkLabel(tutorial_frame, text="Functions", font=("Bahnschrift Light Condensed", 21))
  
 tutorial_find_title = ctk.CTkLabel(tutorial_frame, text="Find duplicates", font=("Bahnschrift Light Condensed", 18))
-tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or sent to the recycle bin.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or sent to the recycle bin", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_sort_title = ctk.CTkLabel(tutorial_frame, text="Sort files", font=("Bahnschrift Light Condensed", 18))
-tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted' folder by date. Choose date taken or date modified, and year/month or year/month/day.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted' folder by date. Choose date taken or date modified, and year/month or year/month/day", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_rename_title = ctk.CTkLabel(tutorial_frame, text="Rename files", font=("Bahnschrift Light Condensed", 18))
-tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores).", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores)", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
  
 tutorial_howto_title = ctk.CTkLabel(tutorial_frame, text="How to use it", font=("Bahnschrift Light Condensed", 21))
-tutorial_howto_text = ctk.CTkLabel(tutorial_frame, text="1.  Press 'Choose a folder' and pick the folder to tidy.\n2.  Adjust the functions in 'Settings' (optional).\n3.  Tick what you want in 'Organize'.\n4.  Press 'Execute' and wait for the status to finish.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
+tutorial_howto_text = ctk.CTkLabel(tutorial_frame, text="1.  Press 'Choose a folder' and pick the folder to tidy.\n2.  Adjust the functions in 'Settings' (optional).\n3.  Tick what you want in 'Organize'.\n4.  Press 'Execute' and wait for the status to finish.\n5.  'Preview' shows what would happen without changing files. 'Restore folder' undoes the last run", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
  
 tutorial_intro_title.grid(row=0, column=0, padx=6, pady=(0,4), sticky="w")
 tutorial_intro_text.grid(row=1, column=0, padx=(8,6), pady=(0,14), sticky="w")
@@ -1151,8 +1183,8 @@ def custom_check(event=None):
         check = 0
     else:
         for char in text.lower():
-            if char == " ":
-                check_text.configure(text=f"Your custom name can't have a space!")
+            if char in (" ", "\n"):
+                check_text.configure(text=f"Your custom name can't have a space or a new line!")
                 custom_check_icon.configure(text="!")
                 check = 0
                 break
@@ -1265,17 +1297,16 @@ set_wat_plus.grid(row=0,column=2, padx=(0,16), sticky="w")
 
 def dry_run_toggle():
     global dry_run
-    global execute_button
     if dry_run == 0:
         dry_run = 1
-        execute_button.configure(text_color="#1f2029")
-        q.put(("status", "Dry run turned on."))
-        logging.info("Dry run turned off.")
+        execute_button.configure(text="Preview", text_color="#1f2029")
+        q.put(("status", "Preview mode on"))
+        logging.info("Preview (dry run) turned on")
     else:
         dry_run = 0
-        execute_button.configure(text_color="white")
-        q.put(("status", "Dry run turned off."))
-        logging.info("Dry run turned off.")
+        execute_button.configure(text="Execute", text_color="white")
+        q.put(("status", "Preview mode off"))
+        logging.info("Preview (dry run) turned off")
     q.put(("status_reset", None))
 
 #organize
@@ -1289,8 +1320,8 @@ execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), fo
 footer = ctk.CTkFrame(middle, width=678, fg_color="#20222e")
 footer.columnconfigure(0, weight=0)
 file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Files that exist only in the cloud are skipped!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
-restore_button = ctk.CTkButton(footer, text="Restore folder", font=("Bahnschrift Light Condensed", 11), command=lambda: start_execute(start_restoring), width=76, height=24)
-dry_run_button = ctk.CTkButton(footer, text="Dry run", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
+restore_button = ctk.CTkButton(footer, text="Restore folder", font=("Bahnschrift Light Condensed", 11), command=restore_click, width=76, height=24)
+dry_run_button = ctk.CTkButton(footer, text="Preview", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
 
 #show tutorial
 if tutorial_seen == 0:
@@ -1299,8 +1330,8 @@ if tutorial_seen == 0:
     try:
         with open(memory, "w") as f:
             json.dump(tutorial_seen, f)
-    except FileNotFoundError:
-        logging.exception("File not found")
+    except OSError:
+        logging.exception("Could not save memory.json")
 else:
     organize_open()
 
@@ -1316,11 +1347,14 @@ right_title.grid(sticky="nw", pady=18, padx=18)
 
 status = ctk.CTkLabel(right, text="Sitting...", font=("Bahnschrift Light Condensed", 22), text_color="grey", fg_color="#1f2029", width=230, height=34, anchor="w")
 status.grid(row=2, sticky="nw", padx=20)
-bar = ctk.CTkProgressBar(right)
+bar_box = ctk.CTkFrame(right, width=230, height=60, fg_color="transparent")
+bar_box.grid(row=3, column=0, sticky="nw")
+bar_box.grid_propagate(False)
+bar = ctk.CTkProgressBar(bar_box)
+bar_text = ctk.CTkLabel(bar_box, text="")
 q.put(("bar_hide", None))
-bar_text = ctk.CTkLabel(right, text="")
 q.put(("bar_text_hide", None))
-
+bar_summary = ctk.CTkFrame(right, fg_color="transparent")
 log_window = None
 
 def close_log():
@@ -1352,7 +1386,7 @@ def open_log():
         return
     log_file = path / "specorde.log"
     if not log_file.exists():
-        messagebox.showinfo("Specorde", "No log file has been created yet.")
+        messagebox.showinfo("Specorde", "No log file has been created yet")
         return
     try:
         with open(log_file, "r", encoding="utf-8", errors="replace") as f:
