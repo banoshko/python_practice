@@ -9,6 +9,8 @@ import os
 import sys
 import customtkinter as ctk
 import time
+import re
+import tempfile
 from logging.handlers import RotatingFileHandler
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
@@ -33,9 +35,24 @@ suffix = [
 q = queue.Queue()
 cfg = {}
 check = 1
-path = Path(os.getenv("APPDATA") or Path.home()) / "Specorde"
-path.mkdir(parents=True, exist_ok=True)
-log_handler = RotatingFileHandler(path / "specorde.log", maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+def make_app_folder():
+    for base in (os.getenv("APPDATA"), Path.home(), tempfile.gettempdir()):
+        if not base:
+            continue
+        try:
+            folder = Path(base) / "Specorde"
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir())
+
+path = make_app_folder()
+try:
+    log_handler = RotatingFileHandler(path / "specorde.log", maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+except OSError:
+    log_handler = logging.NullHandler()
+
 log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S"))
 logging.basicConfig(level=logging.INFO, handlers=[log_handler])
 logging.info("Specorde %s started", app_version)
@@ -45,7 +62,7 @@ sys.excepthook = log_crash
 memory = path / "memory.json"
 journal_path = path / "journals"
 journal_name = None
-size = 0
+size = 1
 dry_run = 0
 
 tutorial_seen = 0
@@ -69,6 +86,10 @@ exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif", ".cr3", ".nef", ".arw", ".dng",
 def start_execute(task):
     threading.Thread(target=task, daemon=True).start()
 
+def lock_ui():
+    for b in (execute_button, folder_browser, restore_button, dry_run_button):
+        b.configure(fg_color="#173348", state="disabled")
+
 def run_execute():
     global cfg
     if "target_folder" not in globals():
@@ -89,7 +110,11 @@ def run_execute():
         messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again")
         return
     if not dry_run:
-        count = sum(1 for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f))
+        try:
+            count = sum(1 for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f))
+        except OSError:
+            messagebox.showwarning("Specorde", "Can't read that folder. Please pick another folder")
+            return
         message = f"This will change files in '{target_folder.name}' ({count} files)"
         if actions_find.get() and settings_duplicate_delete.get() == "Deleted":
             message += "\n\nDuplicates will be sent to the Recycle Bin. On USB or network drives they may be deleted permanently"
@@ -107,8 +132,7 @@ def run_execute():
         "renameby": settings_rename_renameby.get(),
         "custom": settings_rename_custom.get("1.0", "end-1c"),
     }
-    execute_button.configure(state="disabled")
-    q.put(("lock", None))
+    lock_ui()
     start_execute(execute)
 reset_job = None
 SUMMARY_COLOR = "#c8ccd8"
@@ -175,6 +199,7 @@ def check_messages():
             elif kind == "bar_show":
                 bar.grid(row=0, column=0, padx=25, sticky="w", pady=(8,2))
                 bar.set(0)
+                bar_text.configure(text="0%")
             elif kind == "bar_text_show":
                 bar_text.grid(row=1, column=0, padx=32, sticky="w")
             elif kind == "bar_hide":
@@ -242,20 +267,19 @@ def safe_rename(item, destination):
     if dry_run:
         log_preview(f"{item.name}  ->  {short(destination)}")
         return True
+    # Write the journal entry BEFORE moving. If this fails, the file is not touched.
+    try:
+        with open(journal_name, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"from": str(item), "to": str(destination)}) + "\n")
+    except OSError:
+        logging.exception("Could not write journal, leaving %s untouched", item.name)
+        return False
     try:
         item.rename(destination)
     except OSError:
         logging.exception("Could not move or rename %s", item.name)
         return False
     logging.debug("Moved %s -> %s", item.name, short(destination))
-    try:
-        if not journal_name.exists():
-            with open(journal_name, "w") as f:
-                f.write(json.dumps({"folder": str(target_folder)}) + "\n")
-        with open(journal_name, "a") as f:
-            f.write(json.dumps({"from": str(item), "to": str(destination)}) + "\n")
-    except OSError:
-        logging.exception("Moved %s but could not write it to the journal", item.name)
     return True
 
 def remove_duplicate(file, mode):
@@ -278,14 +302,26 @@ def find_last_run():
     try:
         for file in sorted(journal_path.glob("run_*.jsonl"), reverse=True):
             try:
-                with open(file) as f:
-                        header = json.loads(f.readline())
-            except Exception: continue
+                with open(file, "r", encoding="utf-8") as f:
+                    header = json.loads(f.readline())
+                    has_entries = bool(f.readline().strip())
+
+                if not isinstance(header, dict):
+                    logging.error("Invalid journal header: %s", file.name)
+                    continue
+
+                if not has_entries:
+                    continue
+
+            except (OSError, json.JSONDecodeError):
+                logging.exception("Could not read journal: %s", file.name)
+                continue
+
             if header.get("folder") == str(target_folder):
                 return file
-        return None #display message here if folder not restorable
-    except FileNotFoundError: pass
-    except PermissionError: pass
+        return None
+    except (FileNotFoundError, PermissionError):
+        return None
 
 def get_exif(path):
     try:
@@ -335,6 +371,10 @@ def progress(label, done, total):
     q.put(("bar_text", f"{percent:.2f}%"))
     q.put(("bar_set", percent / 100))
 
+def bar_start():
+    global last_progress
+    last_progress = 0.0
+    q.put(("bar_set", 0))
 
 def sort():
     files = list_files(target_folder)
@@ -344,7 +384,7 @@ def sort():
     done = 0
     sorted_count = 0
     failed = 0
-    q.put(("bar_set", 0))
+    bar_start()
 
     for item, item_size in files:
         done += item_size
@@ -387,13 +427,13 @@ def duplicate_finder():
     seen = {}
     removed = 0
     failed = 0
-    q.put(("bar_set", 0))
+    bar_start()
 
     for item, item_size in files:
         done += item_size
         progress("Finding duplicates", done, total)
 
-        if item_size == 0 or sizes[item_size] < 2:
+        if sizes[item_size] < 2:
             continue
         try:
             file_hash = get_hash(item)
@@ -443,7 +483,7 @@ def rename():
     width = len(str(len(files)))
     renamed = 0
     failed = 0
-    q.put(("bar_set", 0))
+    bar_start()
 
     for number, (item, item_size) in enumerate(files, start=1):
         done += item_size
@@ -479,8 +519,10 @@ def rename():
     q.put(("bar_text", "100%"))
     return result(renamed, "file", "renamed", failed)
     
+COPY_RE = re.compile(r"(?: \(\d+\)| - (?:copy|kópia)(?: \(\d+\))?)$", re.IGNORECASE)
+
 def is_copy(file):
-    return any(suf in file.stem for suf in suffix)
+    return bool(COPY_RE.search(file.stem))
 
 def watermark():
     try:
@@ -541,7 +583,12 @@ def pick_folder():
     chosen = filedialog.askdirectory()
     if not chosen:
         return
-    if is_dangerous(Path(chosen)):
+    try:
+        dangerous = is_dangerous(Path(chosen))
+    except OSError:
+        messagebox.showwarning("Specorde", "Can't access that folder. Please pick another folder")
+        return
+    if dangerous:
         messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder")
         return
     target_folder = Path(chosen)
@@ -580,9 +627,11 @@ def execute():
     preview_count = 0
     final_status = "Preview done! See log..." if dry_run else "Done!"
     try:
+        journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.jsonl"
         if not dry_run:
-            journal_path.mkdir(exist_ok=True)
-        journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
+            journal_path.mkdir(parents=True, exist_ok=True)
+            with open(journal_name, "x", encoding="utf-8") as f:
+                f.write(json.dumps({"folder": str(target_folder)}) + "\n")
 
         logging.info("=" * 60)
         logging.info("RUN%s  %s  folder: %s", "  [PREVIEW]" if dry_run else "", datetime.now().strftime("%Y-%m-%d %H:%M"), target_folder)
@@ -626,21 +675,26 @@ def execute():
         q.put(("summary_hide_later", None))
         q.put(("unlock", None))
 
-restore_stats = {"done": 0, "failed": 0, "total": 1}
+restore_stats = {"done": 0, "failed": 0, "missing": 0, "total": 1}
 
 def restore_tick():
     restore_stats["done"] += 1
     progress("Restoring...", restore_stats["done"], restore_stats["total"])
     return 1
 
-def restore_line(count, failed):
-    if not count and not failed:
+def restore_line(count, failed, missing=0):
+    if not count and not failed and not missing:
         return "○ Nothing to restore"
     n = f"{count} change" + ("" if count == 1 else "s")
     text = f"{n} undone"
+    extra = []
+    if missing:
+        extra.append(f"{missing} missing")
     if failed:
-        text += f" ({failed} failed)"
-    return ("✗ " if failed and not count else "✓ ") + text
+        extra.append(f"{failed} failed")
+    if extra:
+        text += " (" + ", ".join(extra) + ")"
+    return ("✗ " if failed or missing else "✓ ") + text
 
 def restore_duplicates(source, dest):
     moved = 0
@@ -706,41 +760,73 @@ def restore_sorted(source, dest):
         except OSError: pass
     return moved
 
+def remove_empty_dirs(root):
+    if not root.is_dir():
+        return
+    for folder, _, _ in os.walk(root, topdown=False):
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+
+def prune_empty_parents(parent):
+    while parent != target_folder and target_folder in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+def restore_skip():
+    restore_stats["done"] += 1
+    progress("Restoring...", restore_stats["done"], restore_stats["total"])
+    return 0
+
 def restore_from_journal(entries):
-        moved = 0
-        moved_sort = 0
-        for entry in reversed(entries):
+    moved = 0
+    for entry in reversed(entries):
+        try:
             moved_to = Path(entry["to"])
             original = Path(entry["from"])
+        except (KeyError, TypeError):
+            logging.error("Bad journal entry: %r", entry)
+            restore_stats["failed"] += 1
+            continue
 
-            if moved_to.exists():
-                try:
-                    counter = 0
-                    destination = original
-                    while destination.exists():
-                        counter += 1
-                        destination = Path(f"{original.parent}/{original.stem}_restored_{counter}{original.suffix}")
-                    moved_to.rename(destination)
-                    moved += restore_tick()
-                    parent = moved_to.parent
-                    while parent != target_folder and target_folder in parent.parents:
-                        try: parent.rmdir()
-                        except OSError: break
-                        parent = parent.parent
-                except OSError:
-                    logging.error("Could not restore %s", moved_to.name)
-                    restore_stats["failed"] += 1
-        if not entries and sorted_dir.exists():
-            moved_sort = restore_sorted(sorted_dir, target_folder)
-            try:
-                sorted_dir.rmdir()
-            except OSError: pass
-        moved += moved_sort
-        return moved
+        try:
+            moved_to.resolve().relative_to(target_folder.resolve())
+            original.resolve().relative_to(target_folder.resolve())
+        except (ValueError, OSError, RuntimeError):
+            logging.error("Journal contains a path outside the selected folder: %r", entry)
+            restore_stats["failed"] += 1
+            continue
+
+        if not moved_to.exists():
+            if not original.exists():
+                logging.warning("Missing, nothing to restore: %s", moved_to)
+                restore_stats["missing"] += 1
+            restore_skip()
+            prune_empty_parents(moved_to.parent)
+            continue
+
+        try:
+            counter = 0
+            destination = original
+            while destination.exists():
+                counter += 1
+                destination = Path(f"{original.parent}/{original.stem}_restored_{counter}{original.suffix}")
+            moved_to.rename(destination)
+            moved += restore_tick()
+            prune_empty_parents(moved_to.parent)
+        except OSError:
+            logging.error("Could not restore %s", moved_to.name)
+            restore_stats["failed"] += 1
+    return moved
 
 def start_restoring():
     global target_folder
     entries = []
+    parse_errors = 0
     moved = 0
     duplicates_moved = 0
     targed_folder_remove = 0
@@ -765,20 +851,23 @@ def start_restoring():
 
         elif not journal_file is None:
             q.put(("status", "Restoring..."))
-            with open(journal_file) as f:
+            with open(journal_file, "r", encoding="utf-8") as f:
                 f.readline()
-                for line in f:
+                for line_number, line in enumerate(f, start=2):
                     try:
                         item = json.loads(line)
                         entries.append(item)
-                    except json.JSONDecodeError: continue
+                    except json.JSONDecodeError:
+                        logging.exception("Invalid journal entry on line %d", line_number)
+                        parse_errors += 1
 
         logging.info("RESTORE  folder: %s", target_folder)
-        restore_stats.update(done=0, failed=0, total=1)
+        restore_stats.update(done=0, failed=0, missing=0, total=1)
+        restore_stats["failed"] += parse_errors
         if target_folder.name in ("sorted_specorde", "duplicates_specorde"):
             restore_stats["total"] = max(sum(1 for p in target_folder.rglob("*") if p.is_file()), 1)
         else:
-            restore_stats["total"] = max(len(entries), 1)
+            restore_stats["total"] = max(len(entries) or sum(1 for d in (sorted_dir, duplicates) if d.exists() for p in d.rglob("*") if p.is_file()), 1)
         q.put(("summary_clear", None))
         q.put(("bar_show", None))
         q.put(("bar_text_show", None))
@@ -803,12 +892,19 @@ def start_restoring():
 
         else:
             moved = restore_from_journal(entries)
-            duplicates_moved = 0 if entries else restore_duplicates(duplicates, target_folder)
-            try:
-                duplicates.rmdir()
-            except OSError: pass
+            if journal_file is None:
+                if sorted_dir.exists():
+                    moved += restore_sorted(sorted_dir, target_folder)
+                    try:
+                        sorted_dir.rmdir()
+                    except OSError: pass
+                duplicates_moved = restore_duplicates(duplicates, target_folder)
+            remove_empty_dirs(sorted_dir)
+            remove_empty_dirs(duplicates)
             if moved or duplicates_moved:
-                q.put(("status", "Everything back in its place!"))
+                q.put(("status", "Restored, some files were missing" if restore_stats["missing"] else "Everything back in its place!"))
+            elif restore_stats["missing"]:
+                q.put(("status", "Restore incomplete: files are missing"))
             else:
                 q.put(("status", "Nothing to restore..."))
             q.put(("status_reset", None))
@@ -821,13 +917,14 @@ def start_restoring():
         if failed:
             q.put(("status", "Restored with errors. See log."))
             q.put(("status_reset", None))
-        q.put(("summary_add", restore_line(total_moved, failed)))
+        q.put(("summary_add", restore_line(total_moved, failed, restore_stats["missing"])))
         q.put(("summary_hide_later", None))
 
-        if journal_file is not None and not failed:
+        if journal_file is not None and not failed and not restore_stats["missing"]:
             try:
                 journal_file.rename(journal_file.with_suffix(".used"))
-            except OSError: pass
+            except OSError:
+                logging.exception("Could not mark journal as used; keeping it for recovery")
 
         if targed_folder_remove == 1:
             try:
@@ -851,8 +948,8 @@ def restore_click():
         return
     if not messagebox.askyesno("Specorde", f"Put the files in '{target_folder.name}' back where they were before the last run?\n\nFiles sent to the Recycle Bin can't be restored by Specorde.\n\nContinue?"):
         return
-    restore_button.configure(state="disabled")
-    start_execute(start_restoring)
+    lock_ui()
+    start_execute(start_restoring) 
 
 def middle_reset():
     global header
@@ -1155,7 +1252,6 @@ def rename_pattern_changed(choice):
         settings_rename_custom.grid_forget()
         settings_rename_custom_text.grid_forget()
         custom_check_icon.grid_forget()
-        custom_check_icon.grid_forget()
         rename_settings.configure(height=96)
         settings_rename_renameby_text.grid(padx=(16,162), pady=8, row=1, column=0, sticky="w")
         settings_rename_renameby.grid(row=1, column=2, padx=(0,16), pady=8, sticky="e")
@@ -1319,7 +1415,7 @@ actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift
 execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
 footer = ctk.CTkFrame(middle, width=678, fg_color="#20222e")
 footer.columnconfigure(0, weight=0)
-file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Files that exist only in the cloud are skipped!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Files that exist only in the cloud are skipped! RAW files are sorted by date modified!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
 restore_button = ctk.CTkButton(footer, text="Restore folder", font=("Bahnschrift Light Condensed", 11), command=restore_click, width=76, height=24)
 dry_run_button = ctk.CTkButton(footer, text="Preview", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
 
