@@ -23,7 +23,7 @@ from send2trash import send2trash
 import ctypes
 
 #version
-app_version = "1.0.1.0"
+app_version = "1.1.0.0"
 
 #Developer settings
 month_dict = {
@@ -70,9 +70,9 @@ try:
     with open(memory, "r", encoding="utf-8") as f:
         tutorial_seen = json.load(f)
 except FileNotFoundError:
-    logging.info("memory.json not found, starting fresh")
+    logging.info("memory.json not found, starting fresh.")
 except (OSError, json.JSONDecodeError):
-    logging.warning("memory.json unreadable, starting fresh")
+    logging.warning("memory.json unreadable, starting fresh.")
 if tutorial_seen not in (0, 1):
     tutorial_seen = 0
 
@@ -93,31 +93,35 @@ def lock_ui():
 def run_execute():
     global cfg
     if "target_folder" not in globals():
-        q.put(("status", "You must pick a folder"))
+        q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
         return
     
     if not (actions_find.get() or actions_sort.get() or actions_rename.get()):
-        q.put(("status", "Tick at least one function"))
+        q.put(("status", "Tick at least one function."))
         q.put(("status_reset", None))
         return
     if actions_rename.get() and settings_rename_pattern.get() == "custom name + number":
         custom_check()
         if check == 0:
-            messagebox.showwarning("Specorde", "Your custom name is not valid. Check it in Settings")
+            messagebox.showwarning("Specorde", "Your custom name is not valid. Check it in Settings.")
             return
     if not target_folder.is_dir():
-        messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again")
+        messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again.")
+        return
+    if target_folder.name in ("sorted_specorde", "duplicates_specorde"):
+        messagebox.showwarning("Specorde", "This is a Specorde output folder. Use 'Restore folder' to put its files back, or pick another folder.")
         return
     if not dry_run:
         try:
             count = sum(1 for f in target_folder.iterdir() if f.is_file() and not is_protected_item(f))
         except OSError:
-            messagebox.showwarning("Specorde", "Can't read that folder. Please pick another folder")
+            messagebox.showwarning("Specorde", "Can't read that folder. Please pick another folder.")
             return
-        message = f"This will change files in '{target_folder.name}' ({count} files)"
+        plural = "" if count == 1 else "s"
+        message = f"This will change files in '{target_folder.name or target_folder}' ({count} file{plural})."
         if actions_find.get() and settings_duplicate_delete.get() == "Deleted":
-            message += "\n\nDuplicates will be sent to the Recycle Bin. On USB or network drives they may be deleted permanently"
+            message += "\n\nDuplicates will be sent to the Recycle Bin. On USB or network drives they may be deleted permanently!"
         if not messagebox.askyesno("Specorde", message + "\n\nContinue?"):
             return
     cfg = {
@@ -140,6 +144,7 @@ PANEL_COLOR = "#1f2029"
 FADE_STEPS = 10
 PREVIEW_LIMIT = 150
 preview_count = 0
+preview_removed = set()
 
 def mix(c1, c2, t):
     a = [int(c1[i:i+2], 16) for i in (1, 3, 5)]
@@ -234,7 +239,7 @@ def check_messages():
 
 def parse_exif_date(text):
     try:
-        return datetime.strptime(text, "%Y:%m:%d %H:%M:%S")
+        return datetime.strptime(text.strip("\x00 "), "%Y:%m:%d %H:%M:%S")
     except ValueError:
         return None
 
@@ -242,12 +247,11 @@ def mark():
     return "○ " if dry_run else "✓ "
 
 def result(count, thing, verb, failed=0):
-    """One summary line: '✓ 3 duplicates moved' or '○ 3 duplicates would be moved'"""
     n = f"{count} {thing}" + ("" if count == 1 else "s")
     text = f"{n} would be {verb}" if dry_run else f"{n} {verb}"
     if failed:
         text += f" ({failed} failed)"
-    return mark() + text
+    return ("✗ " if failed else mark()) + text + "."
 
 def short(p):
     try:
@@ -272,17 +276,19 @@ def safe_rename(item, destination):
         with open(journal_name, "a", encoding="utf-8") as f:
             f.write(json.dumps({"from": str(item), "to": str(destination)}) + "\n")
     except OSError:
-        logging.exception("Could not write journal, leaving %s untouched", item.name)
+        logging.exception("Could not write journal, leaving %s untouched.", item.name)
         return False
     try:
         item.rename(destination)
     except OSError:
-        logging.exception("Could not move or rename %s", item.name)
+        logging.exception("Could not move or rename %s.", item.name)
         return False
     logging.debug("Moved %s -> %s", item.name, short(destination))
     return True
 
 def remove_duplicate(file, mode):
+    if dry_run:
+        preview_removed.add(file)
     if mode == "Moved to a folder":
         if not dry_run:
             duplicates.mkdir(exist_ok=True)
@@ -323,6 +329,19 @@ def find_last_run():
     except (FileNotFoundError, PermissionError):
         return None
 
+def clean_old_journals(days=30):
+    try:
+        old_files = list(journal_path.glob("run_*.used"))
+    except OSError:
+        return
+    limit = time.time() - days * 86400
+    for old in old_files:
+        try:
+            if old.stat().st_mtime < limit:
+                old.unlink()
+        except OSError:
+            logging.exception("Could not delete old journal %s.", old.name)
+
 def get_exif(path):
     try:
         with Image.open(path) as img:
@@ -353,9 +372,9 @@ def get_file_date(item, mode):
             photo_date = parse_exif_date(exif_string) if exif_string else None
             if photo_date:
                 return photo_date
-            logging.warning("No date taken for %s, using date modified instead", item.name)
+            logging.warning("No date taken for %s, using date modified instead.", item.name)
         else:
-            logging.debug("%s has an unsupported suffix, using date modified", item.name)
+            logging.debug("%s has an unsupported suffix, using date modified.", item.name)
     return datetime.fromtimestamp(item.stat().st_mtime)
 
 last_progress = 0.0
@@ -379,7 +398,7 @@ def bar_start():
 def sort():
     files = list_files(target_folder)
     if not files:
-        return mark() + "No files to sort"
+        return mark() + "No files to sort."
     total = sum(s for _, s in files) or 1
     done = 0
     sorted_count = 0
@@ -431,14 +450,14 @@ def duplicate_finder():
 
     for item, item_size in files:
         done += item_size
-        progress("Finding duplicates", done, total)
+        progress("Finding duplicates...", done, total)
 
-        if sizes[item_size] < 2:
+        if sizes[item_size] < 2 or item_size == 0:
             continue
         try:
             file_hash = get_hash(item)
         except OSError:
-            logging.exception("Could not read %s", item.name)
+            logging.exception("Could not read %s.", item.name)
             failed += 1
             continue
 
@@ -456,28 +475,28 @@ def duplicate_finder():
             else:
                 failed += 1
         except Exception:
-            logging.exception("Could not remove duplicate %s", item.name)
+            logging.exception("Could not remove duplicate %s.", item.name)
             failed += 1
 
     q.put(("bar_set", 1))
     q.put(("bar_text", "100%"))
     if removed == 0 and failed == 0:
         old = mode == "Moved to a folder" and duplicates.exists() and any(duplicates.iterdir())
-        return mark() + ("No new duplicates found" if old else "No duplicates found")
+        return mark() + ("No new duplicates found." if old else "No duplicates found.")
     verb = "moved" if mode == "Moved to a folder" else "removed"
     return result(removed, "duplicate", verb, failed)
 
 
 def rename():
     if check == 0:
-        return "✗ Custom name is not valid"
+        return "✗ Custom name is not valid."
     choice = cfg["pattern"]
     renameby = cfg["renameby"]
     custom = cfg["custom"]
 
     files = sorted(list_files(target_folder), key=lambda t: t[0].name.lower())
     if not files:
-        return mark() + "No files to rename"
+        return mark() + "No files to rename."
     total = sum(s for _, s in files) or 1
     done = 0
     width = len(str(len(files)))
@@ -487,7 +506,7 @@ def rename():
 
     for number, (item, item_size) in enumerate(files, start=1):
         done += item_size
-        progress("Renaming the files", done, total)
+        progress("Renaming files...", done, total)
         try:
             number_text = str(number).zfill(width)
             if choice == "date + number":
@@ -528,7 +547,7 @@ def watermark():
     try:
         ()
     except NameError:
-        q.put(("status", "You must pick a folder"))
+        q.put(("status", "You must pick a folder."))
 
 PROTECTED_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", "ntuser.dat", "pagefile.sys", "hiberfil.sys", "swapfile.sys"}
 PROTECTED_SUFFIXES = {".sys", ".dll", ".drv", ".ini", ".exe", ".msi", ".lnk", ".bat", ".cmd", ".reg"}
@@ -552,7 +571,7 @@ def list_files(folder):
     files = []
     for f in folder.iterdir():
         try:
-            if f.is_file() and not is_protected_item(f):
+            if f.is_file() and not is_protected_item(f) and f not in preview_removed:
                 files.append((f, f.stat().st_size))
         except OSError:
             continue
@@ -561,7 +580,8 @@ def list_files(folder):
 def is_dangerous(folder):
     folder = folder.resolve()
     home = Path.home().resolve()
-    if folder == Path(folder.anchor) or folder == home or folder == home.parent:
+    system_root = Path(os.environ.get("SystemDrive", "C:") + "\\")
+    if folder == system_root or folder == home or folder == home.parent:
         return True
     for name in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "APPDATA", "LOCALAPPDATA"):
         value = os.environ.get(name)
@@ -586,17 +606,17 @@ def pick_folder():
     try:
         dangerous = is_dangerous(Path(chosen))
     except OSError:
-        messagebox.showwarning("Specorde", "Can't access that folder. Please pick another folder")
+        messagebox.showwarning("Specorde", "Can't access that folder. Please pick another folder.")
         return
     if dangerous:
-        messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder")
+        messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder.")
         return
     target_folder = Path(chosen)
     folder_browser.configure(text="Choose a different folder")
 
     label_font = ctk.CTkFont(family="Bahnschrift Light Condensed", size=14)
     max_width = 165
-    shown_name = target_folder.name
+    shown_name = target_folder.name or str(target_folder)
     shown_text = f"Folder chosen: '{shown_name}'"
     if label_font.measure(shown_text) > max_width:
         while shown_name and label_font.measure(f"Folder chosen: '{shown_name}...'") > max_width:
@@ -625,7 +645,9 @@ def execute():
     q.put(("summary_clear", None))
     started = time.perf_counter()
     preview_count = 0
+    preview_removed.clear()
     final_status = "Preview done! See log..." if dry_run else "Done!"
+    had_errors = False
     try:
         journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.jsonl"
         if not dry_run:
@@ -660,13 +682,25 @@ def execute():
                 line = step()
             except Exception:
                 logging.exception("%s failed", label)
-                line = f"✗ {label} failed (see log)"
+                line = f"✗ {label} failed (see log)."
+            if line.startswith("✗"):
+                had_errors = True
             q.put(("summary_add", line))
             logging.info("%s: %s  (%.1f s)", label, line[2:], time.perf_counter() - step_started)
+        if had_errors:
+            final_status = "Done with errors. See log..."
     except Exception:
-        logging.exception("Error trying to execute")
+        logging.exception("Error trying to execute.")
         final_status = "Something went wrong. See log..."
     finally:
+        if not dry_run:
+            try:
+                with open(journal_name, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if len(lines) <=1:
+                    journal_name.unlink()
+                    logging.info("This run had no changes. No journal saved.")
+            except OSError: pass
         logging.info("Run finished in %.1f s", time.perf_counter() - started)
         q.put(("bar_text_destroy", None))
         q.put(("bar_destroy", None))
@@ -684,7 +718,7 @@ def restore_tick():
 
 def restore_line(count, failed, missing=0):
     if not count and not failed and not missing:
-        return "○ Nothing to restore"
+        return "○ Nothing to restore."
     n = f"{count} change" + ("" if count == 1 else "s")
     text = f"{n} undone"
     extra = []
@@ -694,7 +728,7 @@ def restore_line(count, failed, missing=0):
         extra.append(f"{failed} failed")
     if extra:
         text += " (" + ", ".join(extra) + ")"
-    return ("✗ " if failed or missing else "✓ ") + text
+    return ("✗ " if failed or missing else "✓ ") + text + "."
 
 def restore_duplicates(source, dest):
     moved = 0
@@ -710,7 +744,7 @@ def restore_duplicates(source, dest):
                     item.rename(destination)
                     moved += restore_tick()
                 except OSError:
-                    logging.error("Could not restore %s", item.name)
+                    logging.error("Could not restore %s.", item.name)
                     restore_stats["failed"] += 1
     return moved
 
@@ -733,7 +767,7 @@ def restore_sorted(source, dest):
                         month_sub.rename(destination)
                         moved += restore_tick()
                     except OSError:
-                        logging.error("Could not restore %s", month_sub.name)
+                        logging.error("Could not restore %s.", month_sub.name)
                         restore_stats["failed"] += 1
                 elif month_sub.name.isdigit():
                     for item in list(month_sub.iterdir()):
@@ -747,7 +781,7 @@ def restore_sorted(source, dest):
                             item.rename(destination)
                             moved += restore_tick()
                         except OSError:
-                            logging.error("Could not restore %s", item.name)
+                            logging.error("Could not restore %s.", item.name)
                             restore_stats["failed"] += 1
                     try:
                         month_sub.rmdir()
@@ -797,7 +831,7 @@ def restore_from_journal(entries):
             moved_to.resolve().relative_to(target_folder.resolve())
             original.resolve().relative_to(target_folder.resolve())
         except (ValueError, OSError, RuntimeError):
-            logging.error("Journal contains a path outside the selected folder: %r", entry)
+            logging.error("Journal contains a path outside the selected folder: %r.", entry)
             restore_stats["failed"] += 1
             continue
 
@@ -819,7 +853,7 @@ def restore_from_journal(entries):
             moved += restore_tick()
             prune_empty_parents(moved_to.parent)
         except OSError:
-            logging.error("Could not restore %s", moved_to.name)
+            logging.error("Could not restore %s.", moved_to.name)
             restore_stats["failed"] += 1
     return moved
 
@@ -829,27 +863,26 @@ def start_restoring():
     parse_errors = 0
     moved = 0
     duplicates_moved = 0
-    targed_folder_remove = 0
+    target_folder_remove = 0
     if "target_folder" not in globals():
-        q.put(("status", "You must pick a folder"))
+        q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
         return
     q.put(("lock", None))
     try:
-
-        journal_file = find_last_run()
-        if journal_file is None:
-            if not duplicates.exists() and not sorted_dir.exists():
-                if target_folder.name != "sorted_specorde" and target_folder.name != "duplicates_specorde":
-                    q.put(("status", "Nothing to restore..."))
-                    q.put(("status_reset", None))
-                    return
         if not target_folder.is_dir():
             q.put(("status", "Your chosen folder no longer exists."))
             q.put(("status_reset", None))
             return
 
-        elif not journal_file is None:
+        journal_file = find_last_run()
+        if journal_file is None:
+            if not duplicates.exists() and not sorted_dir.exists():
+                if target_folder.name not in ("sorted_specorde", "duplicates_specorde"):
+                    q.put(("status", "Nothing to restore..."))
+                    q.put(("status_reset", None))
+                    return
+        else:
             q.put(("status", "Restoring..."))
             with open(journal_file, "r", encoding="utf-8") as f:
                 f.readline()
@@ -858,7 +891,7 @@ def start_restoring():
                         item = json.loads(line)
                         entries.append(item)
                     except json.JSONDecodeError:
-                        logging.exception("Invalid journal entry on line %d", line_number)
+                        logging.exception("Invalid journal entry on line %d.", line_number)
                         parse_errors += 1
 
         logging.info("RESTORE  folder: %s", target_folder)
@@ -874,7 +907,7 @@ def start_restoring():
 
         if target_folder.name == "sorted_specorde":
             moved = restore_sorted(target_folder, target_folder.parent)
-            targed_folder_remove = 1
+            target_folder_remove = 1
             if moved:
                 q.put(("status", "Everything back in its place!"))
             else:
@@ -883,7 +916,7 @@ def start_restoring():
 
         elif target_folder.name == "duplicates_specorde":
             moved = restore_duplicates(target_folder, target_folder.parent)
-            targed_folder_remove = 1
+            target_folder_remove = 1
             if moved:
                 q.put(("status", "Everything back in its place!"))
             else:
@@ -902,16 +935,16 @@ def start_restoring():
             remove_empty_dirs(sorted_dir)
             remove_empty_dirs(duplicates)
             if moved or duplicates_moved:
-                q.put(("status", "Restored, some files were missing" if restore_stats["missing"] else "Everything back in its place!"))
+                q.put(("status", "Restored, some files were missing." if restore_stats["missing"] else "Everything back in its place!"))
             elif restore_stats["missing"]:
-                q.put(("status", "Restore incomplete: files are missing"))
+                q.put(("status", "Restore incomplete: files are missing."))
             else:
                 q.put(("status", "Nothing to restore..."))
             q.put(("status_reset", None))
 
         total_moved = moved + duplicates_moved
         failed = restore_stats["failed"]
-        logging.info("Restore finished: %d undone, %d failed", total_moved, failed)
+        logging.info("Restore finished: %d undone, %d failed.", total_moved, failed)
         q.put(("bar_set", 1))
         q.put(("bar_text", "100%"))
         if failed:
@@ -920,20 +953,20 @@ def start_restoring():
         q.put(("summary_add", restore_line(total_moved, failed, restore_stats["missing"])))
         q.put(("summary_hide_later", None))
 
-        if journal_file is not None and not failed and not restore_stats["missing"]:
+        if journal_file is not None and not failed:
             try:
                 journal_file.rename(journal_file.with_suffix(".used"))
             except OSError:
                 logging.exception("Could not mark journal as used; keeping it for recovery")
 
-        if targed_folder_remove == 1:
+        if target_folder_remove == 1:
             try:
                 target_folder.rmdir()
                 del target_folder
                 q.put(("folder_reset", None))
             except OSError: pass
     except Exception:
-        logging.exception("Restore failed")
+        logging.exception("Restore failed.")
         q.put(("status", "Restore failed. See log."))
         q.put(("status_reset", None))
     finally:
@@ -982,10 +1015,10 @@ def organize_open():
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
     actions_rename.grid(sticky="nw", padx=32, pady=10, row=7)
     execute_button.grid(row=9, column=0, padx=104,pady=24)
-    footer.grid(row=10, column=0, sticky="sw", padx=14, pady=(0,4))
-    file_disclaimer.grid(row=0, column=0, sticky="w", pady=2, padx=8)
-    restore_button.grid(row=0, column=1, sticky="e", padx=(250, 60), pady=8)
-    dry_run_button.grid(row=0, column=1, sticky="e", padx=(365, 0), pady=8)
+    footer.grid(row=10, column=0, sticky="sw", padx=0, pady=(0,0))
+    file_disclaimer.grid(row=0, column=0, sticky="sw", pady=0, padx=12)
+    restore_button.grid(row=0, column=1, sticky="e", padx=(182, 60), pady=6)
+    dry_run_button.grid(row=0, column=1, sticky="e", padx=(226, 0), pady=6)
     currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
 
 def settings_open(option=0):
@@ -1093,6 +1126,19 @@ def log_tk_error(exc, val, tb):
 threading.excepthook = lambda args:logging.error("Thread crashed", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 canvas.report_callback_exception = log_tk_error
 canvas.title("Specorde")
+
+canvas_width, canvas_height = 1152, 648
+try:
+    dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100
+    room_w = canvas.winfo_screenwidth() - 40
+    room_h = canvas.winfo_screenheight() - 120
+    fit = min(room_w / (canvas_width * dpi_scale), room_h / (canvas_height * dpi_scale), 1)
+    if fit < 1:
+        ctk.set_window_scaling(fit)
+        ctk.set_widget_scaling(fit)
+        logging.info("Window scaled by %.2f to fit the screen.", fit)
+except Exception:
+    logging.exception("Could not fit the window to the screen.")
 canvas.geometry("1152x648")
 canvas.resizable(width=False, height=False)
 def on_close():
@@ -1106,8 +1152,9 @@ try:
     canvas.after(500, lambda: canvas.iconbitmap(str(resource_path("specorde_logo.ico"))))
     canvas.after(600, lambda: canvas.iconphoto(True, logo))
 except Exception:
-    logging.exception("Icon failed to load")
+    logging.exception("Icon failed to load.")
 check_messages()
+clean_old_journals()
 
 #left
 left = ctk.CTkFrame(canvas, width=214, height=648, fg_color="#1f2029", corner_radius=0)
@@ -1131,7 +1178,7 @@ settings_button.grid(sticky="nw", pady=18, padx=18)
 tutorial_button = ctk.CTkButton(left, text="Tutorial", font=("Bahnschrift Light Condensed", 16), command=tutorial_open)
 tutorial_button.grid(sticky="nw", pady=18, padx=18)
 left_footer = ctk.CTkLabel(left, text=f"© 2026 Richard Vajko", text_color="grey", font=("Bahnschrift Light Condensed", 11), justify="left")
-left_footer.grid(row=10, column=0, sticky="sw", pady=2, padx=10)
+left_footer.grid(row=10, column=0, sticky="sw", pady=0, padx=12)
 
 #middle
 middle = ctk.CTkFrame(canvas, width=678, height=648, fg_color="#20222e", corner_radius=0)
@@ -1155,7 +1202,7 @@ pictures_label = ctk.CTkLabel(header, text="Pictures", font=("Bahnschrift Light 
 pictures_overview = ctk.CTkButton(header, command=lambda: pictures_change(0), text="Overview", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
 pictures_culling = ctk.CTkButton(header, command=lambda: pictures_change(1), text="Culling", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
 pictures_size_label = ctk.CTkLabel(header, text="Density: ", font=("Bahnschrift Light Condensed", 13))
-pictures_size_changer = ctk.CTkButton(header, command=pictures_size, text="Middle", font=("Bahnschrift Light Condensed", 13), width=77, height=14)
+pictures_size_changer = ctk.CTkButton(header, command=pictures_size, text="Medium", font=("Bahnschrift Light Condensed", 13), width=77, height=14)
 
 #tutorial
 tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 30))
@@ -1163,19 +1210,19 @@ tutorial_frame = ctk.CTkFrame(middle, fg_color="transparent")
 tutorial_frame.grid_columnconfigure(0, weight=1)
  
 tutorial_intro_title = ctk.CTkLabel(tutorial_frame, text="Welcome to Specorde", font=("Bahnschrift Light Condensed", 22))
-tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick what you want done and press Execute. Your progress shows in the Activity panel on the right", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
+tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick what you want done and press Execute. Your progress shows in the Activity panel on the right. Only files directly inside the folder are handled, not subfolders. Shortcuts, programs and hidden or system files are skipped.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
  
 tutorial_functions_title = ctk.CTkLabel(tutorial_frame, text="Functions", font=("Bahnschrift Light Condensed", 21))
  
 tutorial_find_title = ctk.CTkLabel(tutorial_frame, text="Find duplicates", font=("Bahnschrift Light Condensed", 18))
-tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or sent to the recycle bin", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or sent to the recycle bin.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_sort_title = ctk.CTkLabel(tutorial_frame, text="Sort files", font=("Bahnschrift Light Condensed", 18))
-tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted' folder by date. Choose date taken or date modified, and year/month or year/month/day", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted' folder by date. Choose date taken or date modified, and year/month or year/month/day.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_rename_title = ctk.CTkLabel(tutorial_frame, text="Rename files", font=("Bahnschrift Light Condensed", 18))
-tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores)", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores). Renaming twice with 'original name + number' adds a second number.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
  
 tutorial_howto_title = ctk.CTkLabel(tutorial_frame, text="How to use it", font=("Bahnschrift Light Condensed", 21))
-tutorial_howto_text = ctk.CTkLabel(tutorial_frame, text="1.  Press 'Choose a folder' and pick the folder to tidy.\n2.  Adjust the functions in 'Settings' (optional).\n3.  Tick what you want in 'Organize'.\n4.  Press 'Execute' and wait for the status to finish.\n5.  'Preview' shows what would happen without changing files. 'Restore folder' undoes the last run", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
+tutorial_howto_text = ctk.CTkLabel(tutorial_frame, text="1.  Press 'Choose a folder' and pick the folder to tidy.\n2.  Adjust the functions in 'Settings' (optional).\n3.  Tick what you want in 'Organize'.\n4.  Press 'Execute' and wait for the status to finish.\n5.  'Preview' shows what would happen without changing files. 'Restore folder' undoes the last run (press it again for older runs). On USB drives, restoring needs the same drive letter.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
  
 tutorial_intro_title.grid(row=0, column=0, padx=6, pady=(0,4), sticky="w")
 tutorial_intro_text.grid(row=1, column=0, padx=(8,6), pady=(0,14), sticky="w")
@@ -1290,7 +1337,7 @@ def custom_check(event=None):
                 check = 0
                 break
         else:
-            check_text.configure(text=f"Your custom name is:  ' {text} '")
+            check_text.configure(text=f"Your custom name is:  ' {text} '.")
             custom_check_icon.configure(text="✓")
             check = 1
 
@@ -1305,7 +1352,7 @@ settings_rename_pattern = ctk.CTkOptionMenu(rename_settings, values=["original n
 settings_rename_pattern.set("original name + number")
 settings_rename_pattern_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
 settings_rename_pattern.grid(row=0, column=2, padx=16, pady=8, sticky="e")
-custom_check_icon = ctk.CTkLabel(rename_settings, text="!", font=("Bahnschrift Light Condensed", 26), fg_color="#1c1c24", width=32, corner_radius=8)
+custom_check_icon = ctk.CTkLabel(rename_settings, text="!", font=("Bahnschrift Light Condensed", 26), fg_color="#1c1c24", width=42, corner_radius=8)
 
 check_display=ctk.CTkToplevel(canvas)
 check_display.overrideredirect(True)
@@ -1396,12 +1443,12 @@ def dry_run_toggle():
     if dry_run == 0:
         dry_run = 1
         execute_button.configure(text="Preview", text_color="#1f2029")
-        q.put(("status", "Preview mode on"))
+        q.put(("status", "Preview mode on."))
         logging.info("Preview (dry run) turned on")
     else:
         dry_run = 0
         execute_button.configure(text="Execute", text_color="white")
-        q.put(("status", "Preview mode off"))
+        q.put(("status", "Preview mode off."))
         logging.info("Preview (dry run) turned off")
     q.put(("status_reset", None))
 
@@ -1415,7 +1462,7 @@ actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift
 execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
 footer = ctk.CTkFrame(middle, width=678, fg_color="#20222e")
 footer.columnconfigure(0, weight=0)
-file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Files that exist only in the cloud are skipped! RAW files are sorted by date modified!", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Cloud-only files are skipped. Most RAW and HEIC photos use date modified.", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
 restore_button = ctk.CTkButton(footer, text="Restore folder", font=("Bahnschrift Light Condensed", 11), command=restore_click, width=76, height=24)
 dry_run_button = ctk.CTkButton(footer, text="Preview", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
 
@@ -1466,7 +1513,7 @@ def set_log_icon():
         if log_window is not None and log_window.winfo_exists():
             log_window.iconbitmap(str(resource_path("specorde_logo.ico")))
     except Exception:
-        logging.exception("Log window icon failed")
+        logging.exception("Log window icon failed.")
 
 def drop_topmost():
     try:
@@ -1482,7 +1529,7 @@ def open_log():
         return
     log_file = path / "specorde.log"
     if not log_file.exists():
-        messagebox.showinfo("Specorde", "No log file has been created yet")
+        messagebox.showinfo("Specorde", "No log file has been created yet.")
         return
     try:
         with open(log_file, "r", encoding="utf-8", errors="replace") as f:
@@ -1501,15 +1548,15 @@ def open_log():
         log_window.after(300, drop_topmost)
         log_window.focus_force()
     except Exception as e:
-        logging.exception("Could not show log")
+        logging.exception("Could not show log.")
         close_log()
         messagebox.showwarning("Specorde", f"Could not show the log.\n\n({e})")
 #version
 version_frame = ctk.CTkFrame(right, fg_color="transparent")
 version_label = ctk.CTkLabel(version_frame, text=f"v{app_version}", text_color="grey", font=("Bahnschrift Light Condensed", 10))
 log_button = ctk.CTkButton(version_frame, text="Open log", font=("Bahnschrift Light Condensed", 12), command=open_log, width=52, height=24)
-version_frame.grid(row=11, column=0, sticky="sw", padx=14, pady=(0,10))
-version_label.grid(row=0, column=0, sticky="w")
-log_button.grid(row=0, column=2, padx=(152,24), sticky="e")
+version_frame.grid(row=11, column=0, sticky="sw", padx=0, pady=0)
+version_label.grid(row=0, column=0, sticky="sw", padx=12)
+log_button.grid(row=0, column=2, padx=(152,12), sticky="e", pady=6)
 
 canvas.mainloop()
