@@ -29,12 +29,10 @@ app_version = "1.1.0.0"
 month_dict = {
     1: "01 January", 2: "02 February", 3: "03 March", 4: "04 April", 5: "05 May", 6: "06 June", 7: "07 July", 8: "08 August", 9: "09 September", 10: "10 October", 11: "11 November", 12: "12 December"
 }
-suffix = [
-    "(1)", "(2)", "(3)", "(4)", "(5)", "(6)", "(7)", "(8)", "(9)", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)", "(16)", "(17)", "(18)", "(19)", "(20)", "- Copy"
-]
 q = queue.Queue()
 cfg = {}
 check = 1
+frames_loaded = False
 def make_app_folder():
     for base in (os.getenv("APPDATA"), Path.home(), tempfile.gettempdir()):
         if not base:
@@ -63,6 +61,7 @@ memory = path / "memory.json"
 journal_path = path / "journals"
 journal_name = None
 size = 1
+sizes = {0: (108, 144, 5), 1: (138, 184, 4), 2: (188, 251, 3)}
 dry_run = 0
 
 tutorial_seen = 0
@@ -235,7 +234,7 @@ def check_messages():
                 folder_browser.configure(text="Choose a new folder")
                 folder_chosen.configure(text="Folder chosen:")
     except queue.Empty: pass
-    finally: canvas.after(20, check_messages)
+    finally: canvas.after(15, check_messages)
 
 def parse_exif_date(text):
     try:
@@ -599,6 +598,8 @@ def pick_folder():
     global target_folder
     global duplicates
     global sorted_dir
+    global frames_loaded
+    global loaded_count
 
     chosen = filedialog.askdirectory()
     if not chosen:
@@ -613,7 +614,6 @@ def pick_folder():
         return
     target_folder = Path(chosen)
     folder_browser.configure(text="Choose a different folder")
-
     label_font = ctk.CTkFont(family="Bahnschrift Light Condensed", size=14)
     max_width = 165
     shown_name = target_folder.name or str(target_folder)
@@ -623,12 +623,13 @@ def pick_folder():
             shown_name = shown_name[:-1]
         shown_text = f"Folder chosen: '{shown_name.rstrip()}...'"
     folder_chosen.configure(text=shown_text)
-
+    frames_loaded = False
     sorted_dir = Path(target_folder/"sorted_specorde")
     duplicates = Path(target_folder/"duplicates_specorde")
     q.put(("status", "Folder ready!"))
     q.put(("status_reset", None))
     q.put(("unlock", None))
+    if currently_open == 3: pictures_open()
     
 
 allowed_characters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "_", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
@@ -953,7 +954,7 @@ def start_restoring():
         q.put(("summary_add", restore_line(total_moved, failed, restore_stats["missing"])))
         q.put(("summary_hide_later", None))
 
-        if journal_file is not None and not failed:
+        if journal_file is not None and failed - parse_errors == 0:
             try:
                 journal_file.rename(journal_file.with_suffix(".used"))
             except OSError:
@@ -979,7 +980,7 @@ def restore_click():
         q.put(("status", "You must pick a folder."))
         q.put(("status_reset", None))
         return
-    if not messagebox.askyesno("Specorde", f"Put the files in '{target_folder.name}' back where they were before the last run?\n\nFiles sent to the Recycle Bin can't be restored by Specorde.\n\nContinue?"):
+    if not messagebox.askyesno("Specorde", f"Put the files in '{target_folder.name or target_folder}' back where they were before the last run?\n\nFiles sent to the Recycle Bin can't be restored by Specorde.\n\nContinue?"):
         return
     lock_ui()
     start_execute(start_restoring) 
@@ -1009,7 +1010,7 @@ def organize_open():
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     organize_title.grid(sticky="nw", pady=18, padx=18)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(442,8))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
     actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
     actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
     actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
@@ -1031,7 +1032,7 @@ def settings_open(option=0):
     settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(442,8))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
     if option == 1:
         water_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
         water_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
@@ -1056,20 +1057,83 @@ def tutorial_open():
     header.grid(column=0, row=0,sticky="ew", pady=(0,24))
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(442,8))
+    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
     tutorial_frame.grid(row=1, column=0, sticky="nw", padx=18)
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
+
+def cell_padding(index, per_row):
+    column = index % per_row
+    row = index // per_row
+    if column == 0: padx = (24, 6)
+    elif column == per_row - 1: padx = (6, 40)
+    else: padx = 6
+    pady = (28, 12) if row == 0 else 12
+    return padx, pady
+
+batch = 30
+pending_pics = []
+loaded_count = 0
+
+
+def build_batch():
+    global frames_loaded
+    global pending_pics
+    global loaded_count
+
+    x, y, per_row = sizes[size]
+    counter = 0
+    minlc = min(loaded_count + batch, len(pending_pics))
+    for number in range(loaded_count, minlc):
+        pic_frame = ctk.CTkFrame(overview_frame, width=x, height=y, fg_color="#1f2029", corner_radius=4)   
+        row = number // per_row
+        column = number % per_row
+        padx, pady = cell_padding(number, per_row)
+        pic_frame.grid(row=row, column=column, padx=padx, pady=pady)
+        counter += 1
+    frames_loaded = True
+    loaded_count = minlc
+
+watch_job = None
+
+def scroll_watch():
+    global watch_job
+    watch_job = None
+    if not overview_frame.winfo_ismapped():
+        logging.info("scroll_watch stopped: overview frame not visible")
+        return
+    try:
+        if loaded_count < len(pending_pics) and overview_frame._parent_canvas.yview()[1] > 0.85:
+            build_batch()
+    except Exception:
+        logging.exception("scroll_watch failed")
+    watch_job = canvas.after(150, scroll_watch)
+
+def start_watch():
+    global watch_job
+    if watch_job is not None:
+        canvas.after_cancel(watch_job)
+    watch_job = canvas.after(200, scroll_watch)
+
+def redraw(new_size):
+    x, y, per_row = sizes[new_size]
+    for index, frame in enumerate(overview_frame.winfo_children()):
+        frame.configure(width=x, height=y)
+        padx, pady = cell_padding(index, per_row)
+        frame.grid(row=index // per_row, column=index % per_row, padx=padx, pady=pady)
 
 def pictures_open(option=0):
     global middle
     global currently_open
+    global frames_loaded
+    global pending_pics
+    global loaded_count
     middle_reset()
     middle.grid_columnconfigure(0, weight=1)
     middle.grid_rowconfigure(8, weight=1)
     header.grid(column=0, row=0, sticky="ew", pady=(0,16))
     pictures_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
     folder_browser.grid(row=0, column=1, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=1, columnspan=2, sticky="w", pady=(24,18), padx=(304,8))
+    folder_chosen.grid(row=0, column=1, columnspan=2, sticky="w", pady=(24,18), padx=(306,8))
     pictures_overview.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     pictures_culling.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
     pictures_size_label.grid(sticky="e", pady=8, padx=(0,95), column=2, row=1)
@@ -1077,10 +1141,20 @@ def pictures_open(option=0):
     try:
         if option == 0:
             culling_frame.grid_forget()
-            overview_frame.grid(row=2, column=0, sticky="ew")
+            overview_frame.grid(row=1, column=0, sticky="ew")
+            cutesy_bar.grid(row=2, column=0, sticky="ew")
+            if frames_loaded == False:
+                for loaded in overview_frame.winfo_children():
+                    loaded.destroy()
+                loaded_count = 0
+            pics = []
+            start_watch()
             for pic in target_folder.iterdir():
-                if pic.is_file() and pic.suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"]:
-                    ()
+                if pic.is_file() and pic.suffix.lower() in [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"]:
+                    pics.append(pic)
+            pending_pics = pics
+            if not frames_loaded:
+                build_batch()
         elif option == 1:
             overview_frame.grid_forget()
             culling_frame.grid(row=2, column=0, sticky="ew")
@@ -1094,20 +1168,26 @@ def pictures_change(option=0):
 
 def pictures_size():
     global size
+    global loaded_count
     if size != 2:
-        size +=1
+        size += 1
     else:
-        size=0
-    if size==0:
+        size = 0
+
+    if size == 0:
         pictures_size_changer.configure(text="Small")
-        per_row = 6
-    elif size==1:
+    elif size == 1:
         pictures_size_changer.configure(text="Medium")
-        per_row = 4
-    else:
+    elif size == 2:
         pictures_size_changer.configure(text="Large")
-        per_row = 3
-    #return pic_width, pic_height
+
+    for loaded in overview_frame.winfo_children():
+        loaded.destroy()
+    loaded_count = 0
+    build_batch()
+    overview_frame.update_idletasks()
+    overview_frame._parent_canvas.yview_moveto(0)
+    start_watch()
 
 def resource_path(name):
     if getattr(sys, "frozen", False):
@@ -1140,6 +1220,8 @@ try:
 except Exception:
     logging.exception("Could not fit the window to the screen.")
 canvas.geometry("1152x648")
+#plain bind on purpose, prevents clipping when dragging between monitors
+canvas.bind("<Configure>", lambda event: None)
 canvas.resizable(width=False, height=False)
 def on_close():
     if execute_button.cget("state") == "disabled" and not messagebox.askyesno("Specorde", "A task is still running. Quit anyway?\n\nFiles already moved can be put back with 'Restore folder'."):
@@ -1196,8 +1278,9 @@ folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_fold
 folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14), anchor="w")
 
 #pictures
-overview_frame = ctk.CTkScrollableFrame(middle, width=664, height=648, fg_color="#20222e")
-culling_frame = ctk.CTkScrollableFrame(middle, width=664, height=648, fg_color="#20222e")
+overview_frame = ctk.CTkScrollableFrame(middle, width=652, height=492, fg_color="#20222e")
+culling_frame = ctk.CTkScrollableFrame(middle, width=652, height=492, fg_color="#20222e")
+cutesy_bar = ctk.CTkFrame(middle, height = 8, fg_color="#20222e", width=652)
 pictures_label = ctk.CTkLabel(header, text="Pictures", font=("Bahnschrift Light Condensed", 32))
 pictures_overview = ctk.CTkButton(header, command=lambda: pictures_change(0), text="Overview", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
 pictures_culling = ctk.CTkButton(header, command=lambda: pictures_change(1), text="Culling", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
@@ -1215,9 +1298,9 @@ tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick wha
 tutorial_functions_title = ctk.CTkLabel(tutorial_frame, text="Functions", font=("Bahnschrift Light Condensed", 21))
  
 tutorial_find_title = ctk.CTkLabel(tutorial_frame, text="Find duplicates", font=("Bahnschrift Light Condensed", 18))
-tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates' folder or sent to the recycle bin.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates_specorde' folder or sent to the recycle bin.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_sort_title = ctk.CTkLabel(tutorial_frame, text="Sort files", font=("Bahnschrift Light Condensed", 18))
-tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted' folder by date. Choose date taken or date modified, and year/month or year/month/day.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
+tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted_specorde' folder by date. Choose date taken or date modified, and year/month or year/month/day.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
 tutorial_rename_title = ctk.CTkLabel(tutorial_frame, text="Rename files", font=("Bahnschrift Light Condensed", 18))
 tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores). Renaming twice with 'original name + number' adds a second number.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
  
@@ -1551,6 +1634,7 @@ def open_log():
         logging.exception("Could not show log.")
         close_log()
         messagebox.showwarning("Specorde", f"Could not show the log.\n\n({e})")
+
 #version
 version_frame = ctk.CTkFrame(right, fg_color="transparent")
 version_label = ctk.CTkLabel(version_frame, text=f"v{app_version}", text_color="grey", font=("Bahnschrift Light Condensed", 10))
