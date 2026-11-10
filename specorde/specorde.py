@@ -23,6 +23,7 @@ import queue
 from send2trash import send2trash
 import ctypes
 from ctypes import wintypes
+import io
 
 #version
 app_version = "1.1.0.0"
@@ -53,9 +54,29 @@ try:
 except OSError:
     log_handler = logging.NullHandler()
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    heif_ok = True
+except Exception:
+    heif_ok = False
+
+try:
+    import rawpy
+    raw_ok = True
+except Exception:
+    raw_ok = False
+
+try:
+    import exifread
+    exifread_ok = True
+except Exception:
+    exifread_ok = False
+
 log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S"))
 logging.basicConfig(level=logging.INFO, handlers=[log_handler])
 logging.info("Specorde %s started", app_version)
+logging.info("HEIC support: %s, RAW support: %s, RAW dates: %s", heif_ok, raw_ok, exifread_ok)
 def log_crash(exc, val, tb):
     logging.critical("Crashed", exc_info=(exc, val, tb))
 sys.excepthook = log_crash
@@ -82,7 +103,9 @@ if tutorial_seen == 0:
 else:
     currently_open = 0  
 
-exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2"}
+heif_suffixes = {".heic", ".heif"}
+raw_suffixes = {".cr2", ".cr3", ".nef", ".nrw", ".arw", ".dng", ".orf", ".rw2", ".raf", ".pef", ".srw"}
+exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif"} | heif_suffixes | raw_suffixes
 #Script itself
 def start_execute(task):
     threading.Thread(target=task, daemon=True).start()
@@ -343,6 +366,8 @@ def clean_old_journals(days=30):
             logging.exception("Could not delete old journal %s.", old.name)
 
 def get_exif(path):
+    if path.suffix.lower() in raw_suffixes:
+        return exif_from_exifread(path)[0] or exif_from_raw_preview(path)[0] or None
     try:
         with Image.open(path) as img:
             exif = img.getexif()
@@ -599,8 +624,6 @@ def pick_folder():
     global target_folder
     global duplicates
     global sorted_dir
-    global frames_loaded
-    global loaded_count
 
     chosen = filedialog.askdirectory()
     if not chosen:
@@ -995,6 +1018,14 @@ def middle_reset():
     for widget in middle.winfo_children():
         widget.grid_forget()
 pic_suffixes = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
+if heif_ok:
+    pic_suffixes |= heif_suffixes
+if raw_ok:
+    pic_suffixes |= raw_suffixes
+if heif_ok:
+    pic_suffixes |= heif_suffixes
+if raw_ok:
+    pic_suffixes |= raw_suffixes
 view_w = 652
 view_h_base = 492
 grid_left = 24
@@ -1011,7 +1042,7 @@ wheel_max_step = 60
 stack_limit = 3
 stack_peek = 9
 stack_inset = 7
-dbl_ms = 350
+dbl_ms = 250
 ungrouped_first = True
 all_cameras = "All cameras"
 unknown_camera = "Unknown camera"
@@ -1053,6 +1084,49 @@ def grid_view_h(geo):
     h = pic_canvas.winfo_height()
     return h if h > 1 else view_h_base * geo["s"]
 
+def apply_flip(img, flip):
+    if flip == 3:
+        return img.rotate(180)
+    if flip in (5, 6) and img.width >= img.height:
+        return img.rotate(90 if flip == 5 else -90, expand=True)
+    return img
+
+def raw_open(file, need=0):
+    with rawpy.imread(str(file)) as raw:
+        flip = raw.sizes.flip
+        img = None
+        try:
+            thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                img = Image.open(io.BytesIO(thumb.data))
+            elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                img = Image.fromarray(thumb.data)
+        except Exception:
+            img = None
+        if img is not None and max(img.size) < need:
+            img.close()
+            img = None
+        if img is None:
+            return Image.fromarray(raw.postprocess(half_size=True, use_camera_wb=True)), 0
+    if img.getexif().get(274, 1) != 1:
+        return img, 0
+    return img, flip
+
+def load_image(file, target, need=0, mode="RGB"):
+    flip = 0
+    if file.suffix.lower() in raw_suffixes:
+        source, flip = raw_open(file, need)
+    else:
+        source = Image.open(file)
+    try:
+        source.draft(mode, target)
+        out = ImageOps.exif_transpose(source).convert(mode)
+    finally:
+        source.close()
+    if flip:
+        out = apply_flip(out, flip)
+    return out
+
 thumb_cache = OrderedDict()
 thumb_cache_max = 600
 thumb_failed = set()
@@ -1061,16 +1135,78 @@ thumb_requests = queue.LifoQueue()
 thumb_results = queue.Queue()
 thumb_workers = 3
 thumb_per_tick = 6
+thumbs_dir = path / "thumbs"
+thumbs_limit = 600 * 1024 * 1024
+thumb_base_side = 640
+
+try:
+    thumbs_dir.mkdir(exist_ok=True)
+except OSError:
+    logging.warning("Could not create the thumbnail folder.")
+
+def thumb_base_path(file):
+    try:
+        st = file.stat()
+    except OSError:
+        return None
+    key = f"{file}|{st.st_size}|{st.st_mtime_ns}"
+    return thumbs_dir / f"{hashlib.sha1(key.encode('utf-8')).hexdigest()}.jpg"
+
+def thumb_base_save(img, target):
+    tmp = target.with_name(f"{target.stem}.{threading.get_ident()}.tmp")
+    try:
+        img.save(tmp, "JPEG", quality=85)
+        os.replace(tmp, target)
+    except OSError:
+        logging.warning("Could not save a cached thumbnail.")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+def thumb_base(file):
+    cached = thumb_base_path(file)
+    if cached is not None and cached.exists():
+        try:
+            with Image.open(cached) as img:
+                out = img.convert("RGB")
+            try:
+                os.utime(cached)
+            except OSError:
+                pass
+            return out
+        except Exception:
+            logging.warning("Cached thumbnail unreadable, rebuilding: %s", file.name)
+    img = load_image(file, (thumb_base_side * 2, thumb_base_side * 2))
+    img.thumbnail((thumb_base_side, thumb_base_side), Image.BILINEAR)
+    if cached is not None:
+        thumb_base_save(img, cached)
+    return img
+
+def thumbs_trim():
+    try:
+        entries = []
+        total = 0
+        for f in thumbs_dir.glob("*.jpg"):
+            st = f.stat()
+            entries.append((st.st_mtime, st.st_size, f))
+            total += st.st_size
+        if total <= thumbs_limit:
+            return
+        entries.sort()
+        for mtime, size_bytes, f in entries:
+            if total <= thumbs_limit * 0.8:
+                break
+            f.unlink()
+            total -= size_bytes
+    except OSError:
+        logging.exception("Could not trim the thumbnail cache.")
 
 def thumb_key(file, w, h, dim=0):
     return (str(file), w, h, dim)
 
 def thumb_load(file, w, h, dim=0):
-    with Image.open(file) as img:
-        img.draft("RGB", (w * 2, h * 2))
-        img = ImageOps.exif_transpose(img)
-        img = img.convert("RGB")
-        img = ImageOps.fit(img, (w, h), Image.BILINEAR)
+    img = ImageOps.fit(thumb_base(file), (w, h), Image.BILINEAR)
     if dim:
         img = Image.blend(img, Image.new("RGB", img.size, dim_color), 0.5)
     return img
@@ -1128,7 +1264,7 @@ def thumb_worker():
 def start_thumb_workers():
     for _ in range(thumb_workers):
         threading.Thread(target=thumb_worker, daemon=True).start()
-
+threading.Thread(target=thumbs_trim, daemon=True).start()
 def thumb_poll():
     try:
         for _ in range(thumb_per_tick):
@@ -1213,26 +1349,62 @@ def image_hash(gray):
             bits = (bits << 1) | (1 if px[i] > px[i + 1] else 0)
     return bits
 
+def exif_from_pillow(exif):
+    try:
+        ifd = exif.get_ifd(0x8769)
+    except Exception:
+        ifd = {}
+    date = exif_text(ifd.get(36867) or ifd.get(36868) or exif.get(36867))
+    return date, exif_text(ifd.get(37521)), exif_text(exif.get(271)), exif_text(exif.get(272))
+
+def exif_from_exifread(file):
+    if not exifread_ok:
+        return "", "", "", ""
+    try:
+        with open(file, "rb") as f:
+            tags = exifread.process_file(f, details=False)
+    except Exception:
+        logging.warning("exifread could not read %s", file.name)
+        return "", "", "", ""
+
+    def get(name):
+        return exif_text(tags.get(name))
+
+    date = get("EXIF DateTimeOriginal") or get("EXIF DateTimeDigitized")
+    return date, get("EXIF SubSecTimeOriginal"), get("Image Make"), get("Image Model")
+
+def exif_from_raw_preview(file):
+    if not raw_ok:
+        return "", "", "", ""
+    try:
+        with rawpy.imread(str(file)) as raw:
+            thumb = raw.extract_thumb()
+            if thumb.format != rawpy.ThumbFormat.JPEG:
+                return "", "", "", ""
+            with Image.open(io.BytesIO(thumb.data)) as img:
+                return exif_from_pillow(img.getexif())
+    except Exception:
+        return "", "", "", ""
+
 def read_photo_info(file):
-    with Image.open(file) as img:
-        exif = img.getexif()
-        try:
-            ifd = exif.get_ifd(0x8769)
-        except Exception:
-            ifd = {}
-        raw = exif_text(ifd.get(36867) or ifd.get(36868) or exif.get(36867))
-        stamp = None
-        if raw:
-            moment = parse_exif_date(raw)
-            if moment:
-                stamp = (moment - photo_epoch).total_seconds()
-                digits = "".join(ch for ch in exif_text(ifd.get(37521)) if ch.isdigit())
-                if digits:
-                    stamp += float("0." + digits)
-        model = exif_text(exif.get(272))
-        make = exif_text(exif.get(271))
-        img.draft("L", (64, 64))
-        gray = ImageOps.exif_transpose(img).convert("L").resize((9, 8), Image.BILINEAR, reducing_gap=2.0)
+    if file.suffix.lower() in raw_suffixes:
+        date, subsec, make, model = exif_from_exifread(file)
+        if not date:
+            date, subsec, make2, model2 = exif_from_raw_preview(file)
+            make = make or make2
+            model = model or model2
+    else:
+        with Image.open(file) as img:
+            date, subsec, make, model = exif_from_pillow(img.getexif())
+    stamp = None
+    if date:
+        moment = parse_exif_date(date)
+        if moment:
+            stamp = (moment - photo_epoch).total_seconds()
+            digits = "".join(ch for ch in subsec if ch.isdigit())
+            if digits:
+                stamp += float("0." + digits)
+    gray = load_image(file, (64, 64), mode="L").resize((9, 8), Image.BILINEAR, reducing_gap=2.0)
     if model:
         first = make.split()[0].lower() if make else ""
         if not first or model.lower().startswith(first):
@@ -1386,8 +1558,6 @@ other_idx = None
 open_idx = None
 saved_top = 0.0
 hover_idx = None
-click_job = None
-click_idx = None
 keep_file = path / "keeps.json"
 
 def keep_load():
@@ -1416,13 +1586,26 @@ def keep_save():
     except OSError:
         logging.exception("Could not save the keep list.")
 
+keep_save_job = None
+
+def keep_save_now():
+    global keep_save_job
+    keep_save_job = None
+    keep_save()
+
+def keep_save_later():
+    global keep_save_job
+    if keep_save_job is not None:
+        canvas.after_cancel(keep_save_job)
+    keep_save_job = canvas.after(600, keep_save_now)
+
 def lock_toggle(file):
     key = str(file)
     if key in keep_set:
         keep_set.discard(key)
     else:
         keep_set.add(key)
-    keep_save()
+    keep_save_later()
 
 def camera_of(file):
     info = photo_info.get(file)
@@ -1614,6 +1797,7 @@ def group_open(idx):
     culler_info_label.configure(text=group_title(idx))
     header_show()
     groups_show()
+    inspect_preload(idx)
 
 def group_close(event=None):
     global cards
@@ -1621,6 +1805,7 @@ def group_close(event=None):
     global open_idx
     if open_idx is None:
         return
+    click_cancel()
     inspect_close_all()
     compare_close()
     peek_close()
@@ -1664,11 +1849,16 @@ def badge_draw(idx, rect, geo):
         pill_draw(items, left + w - 6 * s - (14 + 8 * len(text)) * s, top + 6 * s, text, "#1f6aa5", s, font)
     if open_idx is None:
         kept = sum(1 for f in card if str(f) in keep_set)
-        label = f"✓ {kept}" if kept else ""
+        if kept:
+            pill_draw(items, left + 6 * s, top + 6 * s, f"✓ {kept}", "#2e8b57", s, font)
     else:
-        label = "Kept" if str(card[0]) in keep_set else ""
-    if label:
-        pill_draw(items, left + 6 * s, top + 6 * s, label, "#2e8b57", s, font)
+        box = tick_box * s
+        x1 = left + 6 * s
+        y1 = top + 6 * s
+        is_kept = str(card[0]) in keep_set
+        items.append(pic_canvas.create_rectangle(x1, y1, x1 + box, y1 + box, fill="#2e8b57" if is_kept else "#101117", outline="white", width=2))
+        if is_kept:
+            items.append(pic_canvas.create_text(x1 + box / 2, y1 + box / 2, text="✓", fill="white", font=font))
     if items:
         pic_badges[idx] = items
 
@@ -1877,16 +2067,14 @@ def pic_hover(event):
     pad = 3 * ui_scale()
     pic_canvas.create_rectangle(left - pad, top - pad, right + pad, bottom + pad, outline=hover_color, width=2, tags="hover")
 
-def card_click(idx):
-    if open_idx is None:
-        return
-    lock_toggle(cards[idx][0])
-    card_redraw(idx)
-
 hold_ms = 250
 press_x = 0
 press_y = 0
 last_click_time = 0.0
+press_on_tick = False
+tick_box = 26
+tick_zone = 38
+inspect_buttons = {}
 last_click_idx = None
 DIFF_THRESHOLD = 22
 DIFF_COLORS = ["#00e5ff", "#ff8a1f", "#9dff3a", "#ff3aa8"]
@@ -1927,6 +2115,16 @@ def group_kept_files():
     kept = [f for f in files if str(f) in keep_set]
     rest = [f for f in files if str(f) not in keep_set]
     return kept, rest
+def clear_kept():
+    kept, _ = group_kept_files()
+    if not kept:
+        return
+    compare_close()
+    for f in kept:
+        keep_set.discard(str(f))
+    keep_save()
+    for f in kept:
+        keep_refresh(f)
 
 def group_buttons_update():
     if open_idx is None:
@@ -1935,6 +2133,7 @@ def group_buttons_update():
     can_compare = 2 <= len(kept) <= 4
     culler_compare_button.configure(text=f"Compare ({len(kept)})", state="normal" if can_compare else "disabled", fg_color="#1f6aa5" if can_compare else "#173348")
     can_delete = bool(kept) and bool(rest)
+    culler_clear_button.configure(state="normal" if kept else "disabled", fg_color="#1f6aa5" if kept else "#173348")
     culler_delete_button.configure(state="normal" if can_delete else "disabled", fg_color="#8b2e2e" if can_delete else "#173348")
     if open_idx == other_idx:
         culler_delete_button.grid_remove()
@@ -1946,6 +2145,7 @@ def inspect_close(win):
         inspect_windows.remove(win)
     for key in [k for k, v in inspect_by_file.items() if v is win]:
         del inspect_by_file[key]
+        inspect_buttons.pop(key, None)
     try:
         win.destroy()
     except Exception:
@@ -1967,19 +2167,47 @@ def peek_close(event=None):
             pass
         peek_window = None
 
-def inspect_load(file, frac_w=0.42, frac_h=0.5):
-    box_w = int(canvas.winfo_screenwidth() * frac_w)
-    box_h = int(canvas.winfo_screenheight() * frac_h)
+inspect_cache = OrderedDict()
+inspect_cache_max = 30
+inspect_preload_max = 24
+inspect_lock = threading.Lock()
+
+def inspect_box(frac_w=0.42, frac_h=0.5):
+    return int(canvas.winfo_screenwidth() * frac_w), int(canvas.winfo_screenheight() * frac_h)
+
+def inspect_load(file, box=None):
+    if box is None:
+        box = inspect_box()
+    box_w, box_h = box
+    key = (str(file), box_w, box_h)
+    with inspect_lock:
+        cached = inspect_cache.get(key)
+        if cached is not None:
+            inspect_cache.move_to_end(key)
+            return cached
     try:
-        with Image.open(file) as img:
-            img.draft("RGB", (box_w * 2, box_h * 2))
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB")
-            img.thumbnail((box_w, box_h))
-            return img
+        img = load_image(file, (box_w * 2, box_h * 2), need=max(box_w, box_h))
+        img.thumbnail((box_w, box_h))
     except Exception:
         logging.exception("Could not open %s for inspecting.", file.name)
         return None
+    with inspect_lock:
+        inspect_cache[key] = img
+        while len(inspect_cache) > inspect_cache_max:
+            inspect_cache.popitem(last=False)
+    return img
+
+def inspect_preload(idx):
+    box = inspect_box()
+    files = list(groups[idx])[:inspect_preload_max]
+
+    def work():
+        for file in files:
+            if open_idx != idx:
+                return
+            inspect_load(file, box)
+
+    threading.Thread(target=work, daemon=True).start()
 
 class MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
@@ -2013,7 +2241,7 @@ def place_at_mouse(win, x, y):
     left, top, right, bottom = monitor_area(x, y)
     px = min(max(x - w // 2, left), max(right - w, left))
     py = min(max(y - h // 2, top), max(bottom - h, top))
-    logging.info("place_at_mouse: mouse=(%s,%s) size=%sx%s monitor=%s result=(%s,%s)", x, y, w, h, (left, top, right, bottom), px, py)
+    logging.debug("place_at_mouse: mouse=(%s,%s) size=%sx%s monitor=%s result=(%s,%s)", x, y, w, h, (left, top, right, bottom), px, py)
 
     def apply():
         try:
@@ -2061,15 +2289,12 @@ def inspect_show(idx, x=None, y=None):
 
     def toggle():
         lock_toggle(file)
-        i = card_index_of(file)
-        if i is not None and (i, 0) in pic_cells:
-            card_redraw(i)
-        keep_button.configure(text=keep_text(file))
-        group_buttons_update()
+        keep_refresh(file)
 
     keep_button = ctk.CTkButton(win, text=keep_text(file), command=toggle, font=(UI_FONT, 16), width=120, height=30)
     keep_button.grid(row=2, column=0, pady=(8, 12))
-
+    inspect_buttons[file] = keep_button
+    
     if x is None:
         center_on_main(win, 28 * len(inspect_windows))
     else:
@@ -2102,47 +2327,78 @@ def peek_start():
     win.bind("<ButtonRelease-1>", peek_close)
     peek_window = win
 
+def click_cancel():
+    global last_click_idx
+    last_click_idx = None
+
+def tick_hit(event, idx):
+    geo = grid_geometry()
+    left, top, w, h = stack_rects(idx, geo)[0]
+    x = pic_canvas.canvasx(event.x)
+    y = pic_canvas.canvasy(event.y)
+    zone = tick_zone * geo["s"]
+    return left <= x <= left + zone and top <= y <= top + zone
+
 def pic_press(event):
-    global press_job, press_idx, press_x, press_y
+    global press_job, press_idx, press_x, press_y, press_on_tick
     peek_close()
     press_idx = card_at(event)
     press_x = event.x_root
     press_y = event.y_root
-    if press_idx is not None:
+    press_on_tick = open_idx is not None and press_idx is not None and tick_hit(event, press_idx)
+    if press_idx is not None and not press_on_tick:
         press_job = pic_canvas.after(hold_ms, peek_start)
 
-def keep_flip(idx):
-    lock_toggle(cards[idx][0])
-    card_redraw(idx)
-    group_buttons_update()
-
 def pic_release(event):
-    global press_job, press_idx, last_click_time, last_click_idx
+    global press_job, press_idx, last_click_idx, last_click_time, press_on_tick
     if peek_window is not None:
         peek_close()
         press_idx = None
-        last_click_idx = None
+        press_on_tick = False
         return
     if press_job is not None:
         pic_canvas.after_cancel(press_job)
         press_job = None
     idx = card_at(event)
     started = press_idx
+    on_tick = press_on_tick
     press_idx = None
+    press_on_tick = False
     if idx is None or idx != started:
         return
     if open_idx is None:
         group_open(idx)
         return
-    now = time.monotonic()
-    if last_click_idx == idx and (now - last_click_time) * 1000 <= dbl_ms:
+    if on_tick and tick_hit(event, idx):
+        last_click_idx = None
+        keep_flip(idx)
+        return
+    now = time.perf_counter()
+    if last_click_idx == idx and now - last_click_time <= dbl_ms / 1000:
         last_click_idx = None
         keep_flip(idx)
         inspect_show(idx, event.x_root, event.y_root)
-    else:
-        last_click_idx = idx
-        last_click_time = now
-        keep_flip(idx)
+        return
+    keep_flip(idx)
+    last_click_idx = idx
+    last_click_time = now
+
+def keep_refresh(file):
+    i = card_index_of(file)
+    if i is not None and (i, 0) in pic_cells:
+        card_redraw(i)
+    button = inspect_buttons.get(file)
+    if button is not None:
+        try:
+            button.configure(text=keep_text(file))
+        except Exception:
+            inspect_buttons.pop(file, None)
+    group_buttons_update()
+
+def keep_flip(idx):
+    file = cards[idx][0]
+    lock_toggle(file)
+    keep_refresh(file)
 
 def compare_close(event=None):
     global compare_window
@@ -2187,42 +2443,49 @@ def estimate_shift(a, b):
         prev = tw
     return dx, dy
 
-def diff_overlay(images, names):
+def trim(text, limit=28):
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+def fit_down(img, box):
+    copy = img.copy()
+    copy.thumbnail(box, Image.BILINEAR)
+    return copy
+
+def diff_align(images):
     w, h = images[0].size
     grays = [im.convert("L") for im in images]
-    shifts = [(0, 0)]
-    aligned = [grays[0]]
-    for g in grays[1:]:
-        dx, dy = estimate_shift(grays[0], g)
-        shifts.append((dx, dy))
-        aligned.append(g.transform((w, h), Image.AFFINE, (1, 0, dx, 0, 1, dy), resample=Image.BILINEAR))
+    shifts = [(0, 0)] + [estimate_shift(grays[0], g) for g in grays[1:]]
     m = max(max(abs(dx), abs(dy)) for dx, dy in shifts) + 3
     if m * 2 >= min(w, h) - 20:
         m = 0
     box = (m, m, w - m, h - m)
-    aligned = [g.crop(box) for g in aligned]
-    size = aligned[0].size
+    colors = []
+    for im, (dx, dy) in zip(images, shifts):
+        moved = im if (dx, dy) == (0, 0) else im.transform((w, h), Image.AFFINE, (1, 0, dx, 0, 1, dy), resample=Image.BILINEAR)
+        colors.append(moved.crop(box))
+    grays = [c.convert("L") for c in colors]
+    mean0 = ImageStat.Stat(grays[0]).mean[0]
+    for k in range(1, len(grays)):
+        off = mean0 - ImageStat.Stat(grays[k]).mean[0]
+        grays[k] = grays[k].point(lambda v, o=off: max(0, min(255, int(v + o))))
+    return {"color": colors, "gray": grays, "size": colors[0].size}
 
-    mean0 = ImageStat.Stat(aligned[0]).mean[0]
-    for k in range(1, len(aligned)):
-        off = mean0 - ImageStat.Stat(aligned[k]).mean[0]
-        aligned[k] = aligned[k].point(lambda v, o=off: max(0, min(255, int(v + o))))
-    blur = [g.filter(ImageFilter.GaussianBlur(2)) for g in aligned]
-
-    out = aligned[0].point(lambda v: int(v * 0.45 + 18)).convert("RGB")
+def diff_highlight(data, names):
+    gray = data["gray"]
+    size = data["size"]
+    blur = [g.filter(ImageFilter.GaussianBlur(2)) for g in gray]
+    out = gray[0].point(lambda v: int(v * 0.45 + 18)).convert("RGB")
     black = Image.new("RGB", size, (0, 0, 0))
     changed = Image.new("L", size, 0)
     legend = []
-
-    if len(images) == 2:
+    if len(gray) == 2:
         specs = [
-            (ImageChops.subtract(blur[0], blur[1]), aligned[0], DIFF_COLORS[0], f"Brighter in {names[0]}"),
-            (ImageChops.subtract(blur[1], blur[0]), aligned[1], DIFF_COLORS[1], f"Brighter in {names[1]}"),
+            (ImageChops.subtract(blur[0], blur[1]), gray[0], DIFF_COLORS[0], f"Brighter in {trim(names[0])}"),
+            (ImageChops.subtract(blur[1], blur[0]), gray[1], DIFF_COLORS[1], f"Brighter in {trim(names[1])}"),
         ]
     else:
-        legend.append(("#8a8f9c", f"Base: {names[0]}"))
-        specs = [(ImageChops.difference(blur[0], blur[k]), aligned[k], DIFF_COLORS[k - 1], f"{names[k]} differs") for k in range(1, len(images))]
-
+        legend.append(("#8a8f9c", f"Base: {trim(names[0])}"))
+        specs = [(ImageChops.difference(blur[0], blur[k]), gray[k], DIFF_COLORS[k - 1], f"{trim(names[k])} differs") for k in range(1, len(gray))]
     for delta, src, color, label in specs:
         mask = delta.point(lambda v: 255 if v > DIFF_THRESHOLD else 0)
         mask = mask.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(7))
@@ -2235,9 +2498,20 @@ def diff_overlay(images, names):
         out = ImageChops.screen(out, layer)
         out = ImageChops.screen(out, edge_layer)
         legend.append((color, label))
-
     pct = changed.histogram()[255] * 100 / (size[0] * size[1])
     return out, legend, pct
+
+COMPARE_MODES = ("Side by side", "Blink", "Slider", "Highlights")
+DIFF_MODES = ("Highlights",)
+PAD_COLOR = "#101117"
+MODE_HELP = {
+    "Side by side": "Scroll to zoom, drag to pan, double-click to jump to full size. All photos move together. 'Keep this one' keeps that photo and un-keeps the other compared ones.",
+    "Slider": "Move the mouse across the photo to wipe from one shot to the other.",
+    "Highlights": "Coloured glow where the shots differ. Shots are lined up first, so camera shake is ignored.",
+}
+zoom_source_side = 4000
+zoom_step = 1.25
+zoom_cap = 10.0
 
 def compare_open():
     global compare_window
@@ -2248,50 +2522,52 @@ def compare_open():
     compare_close()
     sw = canvas.winfo_screenwidth()
     sh = canvas.winfo_screenheight()
-    fulls = []
+    max_w = int(sw * 0.86)
+    max_h = int(sh * 0.56)
+    originals = []
     try:
         for f in kept:
-            with Image.open(f) as img:
-                img.draft("RGB", (sw, sh))
-                img = ImageOps.exif_transpose(img).convert("RGB")
-                img.thumbnail((int(sw * 0.6), int(sh * 0.62)))
-                fulls.append(img)
+            img = load_image(f, (max_w * 2, max_h * 2), need=max(max_w, max_h))
+            img.thumbnail((max_w, max_h))
+            originals.append(img)
     except Exception:
         logging.exception("Could not open photos for comparing.")
         return
-    base = fulls[0].size
-    fulls = [i if i.size == base else i.resize(base, Image.BILINEAR) for i in fulls]
-    scale = min(1.0, (sw * 0.9 / n - 30) / base[0], sh * 0.55 / base[1])
-    side_size = (max(int(base[0] * scale), 1), max(int(base[1] * scale), 1))
+    base = originals[0].size
+    shared = [i if i.size == base else ImageOps.pad(i, base, method=Image.BILINEAR, color=PAD_COLOR) for i in originals]
+    ratios = [i.size[0] / i.size[1] for i in originals]
+    shapes_differ = max(ratios) / min(ratios) > 1.05
+    cell_w = max((max_w - 28 * n) // n, 120)
+    names = [f.name for f in kept]
 
     win = ctk.CTkToplevel(canvas)
     win.withdraw()
     win.title("Compare")
-    win.configure(fg_color="#101117")
+    win.configure(fg_color=PAD_COLOR)
     win.resizable(False, False)
     win.transient(canvas)
     win.protocol("WM_DELETE_WINDOW", compare_close)
     compare_window = win
 
-    side_photos = [ImageTk.PhotoImage(i.resize(side_size, Image.BILINEAR)) for i in fulls]
-    full_photos = [ImageTk.PhotoImage(i) for i in fulls]
+    side_photos = [ImageTk.PhotoImage(fit_down(i, (cell_w, max_h))) for i in originals]
+    full_photos = [ImageTk.PhotoImage(i) for i in shared]
 
     modes = ctk.CTkFrame(win, fg_color="transparent")
     modes.grid(row=0, column=0, pady=(12, 4))
-    view = tk.Frame(win, bg="#101117")
+    view = tk.Frame(win, bg=PAD_COLOR)
     view.grid(row=1, column=0, padx=16, pady=4)
-    caption = tk.Label(win, text="", bg="#101117", fg="#c8ccd8", font=(UI_FONT, 12))
+    caption = tk.Label(win, text="", bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12), wraplength=max_w, justify="center")
     caption.grid(row=2, column=0, pady=(2, 4))
-    legend_frame = tk.Frame(win, bg="#101117")
+    legend_frame = tk.Frame(win, bg=PAD_COLOR)
     legend_frame.grid(row=3, column=0, pady=(0, 12))
-    state = {"mode": "side", "blink": 0, "label": None, "diff": None}
+    state = {"mode": "Side by side", "blink": 0, "pair": 0, "label": None, "diff": None, "busy": False, "views": {}, "zoom": 1.0, "cx": 0.5, "cy": 0.5, "src": list(originals), "cells": [], "shown": [], "drag": None, "side_job": None}
 
     def blink_caption():
         i = state["blink"]
-        caption.configure(text=f"Blink · {kept[i].name} ({i + 1} of {n}) · click the photo or press Space to flip")
+        caption.configure(text=f"Blink · {trim(names[i])} ({i + 1} of {n}) · click the photo or press Space to flip")
 
     def flip(event=None):
-        if state["mode"] != "blink" or state["label"] is None:
+        if state["mode"] != "Blink" or state["label"] is None:
             return
         state["blink"] = (state["blink"] + 1) % n
         state["label"].configure(image=full_photos[state["blink"]])
@@ -2304,73 +2580,274 @@ def compare_open():
         if str(file) not in keep_set:
             lock_toggle(file)
         for f in kept:
-            i = card_index_of(f)
-            if i is not None and (i, 0) in pic_cells:
-                card_redraw(i)
-        group_buttons_update()
+            keep_refresh(f)
         compare_close()
 
-    def diff_prepare():
-        if state["diff"] is not None:
-            return
-        caption.configure(text="Comparing...")
-        win.update_idletasks()
+    def next_pair():
+        state["pair"] += 1
+        draw()
+
+    def side_zmax():
+        ratios_now = [state["src"][i].size[0] / cell[2] for i, cell in enumerate(state["cells"])]
+        if not ratios_now:
+            return 1.0
+        return max(1.5, min(min(ratios_now), zoom_cap))
+
+    def side_clamp():
+        half = 0.5 / state["zoom"]
+        state["cx"] = max(half, min(1 - half, state["cx"]))
+        state["cy"] = max(half, min(1 - half, state["cy"]))
+
+    def side_render(i):
+        cell, item, dw, dh = state["cells"][i]
+        zoom = state["zoom"]
+        if zoom <= 1.0001:
+            photo = side_photos[i]
+        else:
+            src = state["src"][i]
+            src_w, src_h = src.size
+            half = 0.5 / zoom
+            box = (max(0.0, (state["cx"] - half) * src_w), max(0.0, (state["cy"] - half) * src_h), min(float(src_w), (state["cx"] + half) * src_w), min(float(src_h), (state["cy"] + half) * src_h))
+            photo = ImageTk.PhotoImage(src.resize((dw, dh), Image.BILINEAR, box=box))
+        state["shown"][i] = photo
+        cell.itemconfigure(item, image=photo)
+
+    def side_apply():
+        state["side_job"] = None
         try:
-            img, legend, pct = diff_overlay(fulls, [f.name for f in kept])
-            state["diff"] = (ImageTk.PhotoImage(img), legend, pct)
+            if not win.winfo_exists():
+                return
+            for i in range(len(state["cells"])):
+                side_render(i)
         except Exception:
-            logging.exception("Could not build the difference view.")
-            state["diff"] = False
+            logging.exception("Could not redraw the zoomed photos.")
+
+    def side_schedule():
+        if state["side_job"] is None:
+            state["side_job"] = win.after(16, side_apply)
+
+    def side_wheel(event, i):
+        cell, item, dw, dh = state["cells"][i]
+        old = state["zoom"]
+        new = max(1.0, min(side_zmax(), old * zoom_step ** (event.delta / 120)))
+        if new == old:
+            return "break"
+        px = event.x / dw
+        py = event.y / dh
+        u = state["cx"] - 0.5 / old + px / old
+        v = state["cy"] - 0.5 / old + py / old
+        state["zoom"] = new
+        state["cx"] = u - px / new + 0.5 / new
+        state["cy"] = v - py / new + 0.5 / new
+        side_clamp()
+        side_schedule()
+        return "break"
+
+    def side_press(event):
+        state["drag"] = (event.x, event.y)
+
+    def side_drag(event, i):
+        cell, item, dw, dh = state["cells"][i]
+        last = state["drag"]
+        state["drag"] = (event.x, event.y)
+        if last is None or state["zoom"] <= 1.0:
+            return
+        state["cx"] -= (event.x - last[0]) / (dw * state["zoom"])
+        state["cy"] -= (event.y - last[1]) / (dh * state["zoom"])
+        side_clamp()
+        side_schedule()
+
+    def side_toggle(event, i):
+        cell, item, dw, dh = state["cells"][i]
+        if state["zoom"] > 1.0:
+            state["zoom"] = 1.0
+            state["cx"] = 0.5
+            state["cy"] = 0.5
+        else:
+            state["zoom"] = side_zmax()
+            state["cx"] = event.x / dw
+            state["cy"] = event.y / dh
+            side_clamp()
+        side_schedule()
+
+    def side_reset(event=None):
+        state["zoom"] = 1.0
+        state["cx"] = 0.5
+        state["cy"] = 0.5
+        side_schedule()
+
+    def full_begin():
+        holder = {}
+
+        def work():
+            try:
+                images = []
+                for f in kept:
+                    img = load_image(f, (zoom_source_side * 2, zoom_source_side * 2), need=zoom_source_side // 2)
+                    img.thumbnail((zoom_source_side, zoom_source_side))
+                    images.append(img)
+                holder["images"] = images
+            except Exception:
+                logging.exception("Could not load the full size photos for zooming.")
+                holder["images"] = False
+
+        def poll():
+            try:
+                if not win.winfo_exists():
+                    return
+                if "images" not in holder:
+                    win.after(120, poll)
+                    return
+                if holder["images"]:
+                    state["src"] = holder["images"]
+                    side_schedule()
+            except Exception:
+                logging.exception("Zoom loading check failed.")
+
+        threading.Thread(target=work, daemon=True).start()
+        win.after(120, poll)
+
+    def diff_begin():
+        if state["busy"]:
+            return
+        state["busy"] = True
+        holder = {}
+
+        def work():
+            try:
+                holder["data"] = diff_align(shared)
+            except Exception:
+                logging.exception("Could not line the photos up.")
+                holder["data"] = False
+
+        def poll():
+            try:
+                if not win.winfo_exists():
+                    return
+                if "data" not in holder:
+                    win.after(80, poll)
+                    return
+                state["busy"] = False
+                state["diff"] = holder["data"]
+                if state["mode"] in DIFF_MODES:
+                    draw()
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+        win.after(80, poll)
+
+    def diff_view(mode):
+        views = state["views"]
+        if mode not in views:
+            try:
+                img, legend, pct = diff_highlight(state["diff"], names)
+                views[mode] = (ImageTk.PhotoImage(img), legend, pct)
+            except Exception:
+                logging.exception("Could not build the %s view.", mode)
+                views[mode] = None
+        return views[mode]
+
+    def slider_draw():
+        k = state["pair"] % (n - 1)
+        a, b = shared[k], shared[k + 1]
+        wd, ht = a.size
+        photo = ImageTk.PhotoImage(a)
+        cv = tk.Canvas(view, width=wd, height=ht, bg=PAD_COLOR, highlightthickness=0, cursor="sb_h_double_arrow")
+        cv.grid(row=0, column=0)
+        cv.create_image(0, 0, image=photo, anchor="nw")
+        line = cv.create_line(0, 0, 0, ht, fill="#ffffff", width=2)
+        cv.photo = photo
+
+        def wipe(x):
+            x = max(0, min(wd, int(x)))
+            mixed = a.copy()
+            if x < wd:
+                mixed.paste(b.crop((x, 0, wd, ht)), (x, 0))
+            photo.paste(mixed)
+            cv.coords(line, x, 0, x, ht)
+
+        cv.bind("<Motion>", lambda e: wipe(e.x))
+        cv.bind("<B1-Motion>", lambda e: wipe(e.x))
+        wipe(wd // 2)
+        if n > 2:
+            ctk.CTkButton(view, text="Next pair", width=100, height=24, font=(UI_FONT, 14), command=next_pair).grid(row=1, column=0, pady=(8, 0))
+        caption.configure(text=f"Slider · {trim(names[k])} on the left, {trim(names[k + 1])} on the right · {MODE_HELP['Slider']}")
 
     def draw():
+        state["cells"] = []
         for w in view.winfo_children():
             w.destroy()
         for w in legend_frame.winfo_children():
             w.destroy()
         state["label"] = None
         mode = state["mode"]
-        if mode == "side":
+        if mode == "Side by side":
+            cells = []
             for i, f in enumerate(kept):
-                col = tk.Frame(view, bg="#101117", highlightbackground=card_edge, highlightthickness=2, bd=0)
-                col.grid(row=0, column=i, padx=6)
-                tk.Label(col, image=side_photos[i], bd=0, bg="#101117").grid(padx=4, pady=4)
-                tk.Label(col, text=f.name, bg="#101117", fg="#c8ccd8", font=(UI_FONT, 12)).grid()
+                col = tk.Frame(view, bg=PAD_COLOR, highlightbackground=card_edge, highlightthickness=2, bd=0)
+                col.grid(row=0, column=i, padx=6, sticky="n")
+                dw = side_photos[i].width()
+                dh = side_photos[i].height()
+                cell = tk.Canvas(col, width=dw, height=dh, bg=PAD_COLOR, highlightthickness=0, bd=0, cursor="fleur")
+                cell.grid(padx=4, pady=4)
+                item = cell.create_image(0, 0, image=side_photos[i], anchor="nw")
+                cell.bind("<MouseWheel>", lambda e, i=i: side_wheel(e, i))
+                cell.bind("<ButtonPress-1>", side_press)
+                cell.bind("<B1-Motion>", lambda e, i=i: side_drag(e, i))
+                cell.bind("<Double-Button-1>", lambda e, i=i: side_toggle(e, i))
+                cells.append((cell, item, dw, dh))
+                tk.Label(col, text=trim(f.name), bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12)).grid()
                 ctk.CTkButton(col, text="Keep this one", width=100, height=22, font=(UI_FONT, 13), command=lambda f=f: choose(f)).grid(pady=6)
-            caption.configure(text="Side by side · 'Keep this one' keeps that photo and drops the other shortlisted ones")
-        elif mode == "blink":
-            lab = tk.Label(view, image=full_photos[state["blink"]], bd=0, bg="#101117", cursor="hand2")
+            state["cells"] = cells
+            state["shown"] = [None] * n
+            caption.configure(text=MODE_HELP[mode])
+            side_schedule()
+        elif mode == "Blink":
+            lab = tk.Label(view, image=full_photos[state["blink"]], bd=0, bg=PAD_COLOR, cursor="hand2")
             lab.grid()
             lab.bind("<ButtonRelease-1>", flip)
             ctk.CTkButton(view, text="Keep this one", width=120, height=26, font=(UI_FONT, 14), command=lambda: choose(kept[state["blink"]])).grid(pady=(8, 0))
             state["label"] = lab
             blink_caption()
+        elif mode == "Slider":
+            slider_draw()
+        elif state["diff"] is None:
+            diff_begin()
+            caption.configure(text="Comparing... lining the photos up first")
+        elif state["diff"] is False:
+            caption.configure(text="Could not build this view (see the log).")
         else:
-            diff_prepare()
-            if not state["diff"]:
-                caption.configure(text="Could not build the difference view (see log).")
+            result = diff_view(mode)
+            if result is None:
+                caption.configure(text="Could not build this view (see the log).")
             else:
-                photo, legend, pct = state["diff"]
-                tk.Label(view, image=photo, bd=0, bg="#101117").grid()
-                if pct < 0.2:
-                    caption.configure(text="Difference · nothing significant moved between these shots")
-                else:
-                    caption.configure(text=f"Difference · {pct:.1f}% of the picture changed · shots are aligned first, so camera shake is ignored")
-                for k, (color, text) in enumerate(legend):
+                photo, legend, pct = result
+                tk.Label(view, image=photo, bd=0, bg=PAD_COLOR).grid()
+                info = MODE_HELP[mode]
+                if pct is not None:
+                    info += " · nothing significant changed" if pct < 0.2 else f" · {pct:.1f}% of the picture changed"
+                if shapes_differ:
+                    info += " · the photos have different shapes, so treat this with care"
+                caption.configure(text=info)
+                for k, (color, label) in enumerate(legend):
                     tk.Label(legend_frame, text="   ", bg=color).grid(row=0, column=2 * k, padx=(10, 4))
-                    tk.Label(legend_frame, text=text, bg="#101117", fg="#c8ccd8", font=(UI_FONT, 12)).grid(row=0, column=2 * k + 1)
+                    tk.Label(legend_frame, text=label, bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12)).grid(row=0, column=2 * k + 1)
         center_on_main(win)
 
-    def set_mode(mode):
-        state["mode"] = mode
+    def set_mode(value):
+        state["mode"] = value
         draw()
 
-    ctk.CTkButton(modes, text="Side by side", width=100, height=24, font=(UI_FONT, 14), command=lambda: set_mode("side")).grid(row=0, column=0, padx=4)
-    ctk.CTkButton(modes, text="Blink", width=100, height=24, font=(UI_FONT, 14), command=lambda: set_mode("blink")).grid(row=0, column=1, padx=4)
-    ctk.CTkButton(modes, text="Difference", width=100, height=24, font=(UI_FONT, 14), command=lambda: set_mode("diff")).grid(row=0, column=2, padx=4)
+    mode_bar = ctk.CTkSegmentedButton(modes, values=list(COMPARE_MODES), command=set_mode, font=(UI_FONT, 14))
+    mode_bar.set(state["mode"])
+    mode_bar.grid(row=0, column=0)
 
     win.bind("<space>", flip)
+    win.bind("<Key-0>", side_reset)
     win.bind("<Escape>", compare_close)
     draw()
+    full_begin()
     win.after(300, lambda: set_inspect_icon(win))
     win.after(60, lambda: reveal(win))
 
@@ -2557,7 +3034,7 @@ def tutorial_open():
     tutorial_label.grid(sticky="nw", pady=18, padx=18)
     folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
     folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
-    tutorial_frame.grid(row=1, column=0, sticky="nw", padx=18)
+    tutorial_frame.grid(row=1, column=0, sticky="nw", padx=(18, 6))
     currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
 
 def resource_path(name):
@@ -2598,6 +3075,8 @@ canvas.resizable(width=False, height=False)
 def on_close():
     if execute_button.cget("state") == "disabled" and not messagebox.askyesno("Specorde", "A task is still running. Quit anyway?\n\nFiles already moved can be put back with 'Restore folder'."):
         return
+    if keep_save_job is not None:
+        keep_save()
     canvas.destroy()
 
 canvas.protocol("WM_DELETE_WINDOW", on_close)
@@ -2687,39 +3166,56 @@ culler_delete_button = ctk.CTkButton(culler_group_tools, command=delete_rest, te
 culler_info_label.grid(row=0, column=0, padx=(0,12))
 culler_compare_button.grid(row=0, column=1, padx=(0,8))
 culler_delete_button.grid(row=0, column=2)
+culler_clear_button = ctk.CTkButton(culler_group_tools, command=clear_kept, text="Clear kept", font=("Bahnschrift Light Condensed", 13), width=76, height=14, state="disabled", fg_color="#173348")
+culler_clear_button.grid(row=0, column=3, padx=(8, 0))
 culler_camera_menu = ctk.CTkOptionMenu(header, values=["Camera"], command=camera_changed, font=("Bahnschrift Light Condensed", 13), width=126, height=22, dynamic_resizing=False)
 
 #tutorial
 tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 30))
-tutorial_frame = ctk.CTkFrame(middle, fg_color="transparent")
+tutorial_frame = ctk.CTkScrollableFrame(middle, width=590, height=470, fg_color="transparent")
 tutorial_frame.grid_columnconfigure(0, weight=1)
- 
-tutorial_intro_title = ctk.CTkLabel(tutorial_frame, text="Welcome to Specorde", font=("Bahnschrift Light Condensed", 22))
-tutorial_intro_text = ctk.CTkLabel(tutorial_frame, text="Pick a folder, tick what you want done and press Execute. Your progress shows in the Activity panel on the right. Only files directly inside the folder are handled, not subfolders. Shortcuts, programs and hidden or system files are skipped.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
- 
-tutorial_functions_title = ctk.CTkLabel(tutorial_frame, text="Functions", font=("Bahnschrift Light Condensed", 21))
- 
-tutorial_find_title = ctk.CTkLabel(tutorial_frame, text="Find duplicates", font=("Bahnschrift Light Condensed", 18))
-tutorial_find_text = ctk.CTkLabel(tutorial_frame, text="Finds identical files. In Settings, choose if they're moved to a 'duplicates_specorde' folder or sent to the recycle bin.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
-tutorial_sort_title = ctk.CTkLabel(tutorial_frame, text="Sort files", font=("Bahnschrift Light Condensed", 18))
-tutorial_sort_text = ctk.CTkLabel(tutorial_frame, text="Moves files into a 'sorted_specorde' folder by date. Choose date taken or date modified, and year/month or year/month/day.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
-tutorial_rename_title = ctk.CTkLabel(tutorial_frame, text="Rename files", font=("Bahnschrift Light Condensed", 18))
-tutorial_rename_text = ctk.CTkLabel(tutorial_frame, text="Gives your files new numbered names. Choose the original name, a date or your own name (up to 16 letters, numbers or underscores). Renaming twice with 'original name + number' adds a second number.", text_color="grey", font=("Bahnschrift Light Condensed", 15), wraplength=480, justify="left", anchor="w")
- 
-tutorial_howto_title = ctk.CTkLabel(tutorial_frame, text="How to use it", font=("Bahnschrift Light Condensed", 21))
-tutorial_howto_text = ctk.CTkLabel(tutorial_frame, text="1.  Press 'Choose a folder' and pick the folder to tidy.\n2.  Adjust the functions in 'Settings' (optional).\n3.  Tick what you want in 'Organize'.\n4.  Press 'Execute' and wait for the status to finish.\n5.  'Preview' shows what would happen without changing files. 'Restore folder' undoes the last run (press it again for older runs). On USB drives, restoring needs the same drive letter.", font=("Bahnschrift Light Condensed", 16), wraplength=480, justify="left", anchor="w")
- 
-tutorial_intro_title.grid(row=0, column=0, padx=6, pady=(0,4), sticky="w")
-tutorial_intro_text.grid(row=1, column=0, padx=(8,6), pady=(0,14), sticky="w")
-tutorial_functions_title.grid(row=2, column=0, padx=(6,6), pady=(0,6), sticky="w")
-tutorial_find_title.grid(row=3, column=0, padx=(10,6), sticky="w")
-tutorial_find_text.grid(row=4, column=0, padx=(12,6), pady=(0,8), sticky="w")
-tutorial_sort_title.grid(row=5, column=0, padx=(10,6), sticky="w")
-tutorial_sort_text.grid(row=6, column=0, padx=(12,6), pady=(0,8), sticky="w")
-tutorial_rename_title.grid(row=7, column=0, padx=(10,6), sticky="w")
-tutorial_rename_text.grid(row=8, column=0, padx=(12,6), pady=(0,14), sticky="w")
-tutorial_howto_title.grid(row=9, column=0, padx=(6,6), pady=(0,6), sticky="w")
-tutorial_howto_text.grid(row=10, column=0, padx=(14,6), sticky="w")
+
+tutorial_style = {
+    "h1": (("Bahnschrift Light Condensed", 24), None, (0, 4), 6),
+    "h2": (("Bahnschrift Light Condensed", 20), None, (16, 4), 6),
+    "h3": (("Bahnschrift Light Condensed", 17), None, (8, 0), 12),
+    "p": (("Bahnschrift Light Condensed", 15), "#aab0c0", (0, 2), 12),
+}
+tutorial_text = [
+    ("h1", "Welcome to Specorde"),
+    ("p", "Specorde tidies folders and helps you pick the best photos. It has two tools on the left, Organize and Culler. Everything it moves is written to a journal, so 'Restore folder' can put it back. Only files directly inside the chosen folder are used, not subfolders. Shortcuts, programs and hidden or system files are always skipped."),
+    ("h2", "Organize"),
+    ("p", "Choose a folder, tick what you want and press Execute. Progress shows in the Activity panel on the right."),
+    ("h3", "Find duplicates"),
+    ("p", "Finds identical files. In Settings, choose if they're moved to a 'duplicates_specorde' folder or sent to the Recycle Bin. Specorde cannot restore files from the Recycle Bin."),
+    ("h3", "Sort files"),
+    ("p", "Moves files into a 'sorted_specorde' folder by date. Choose date taken or date modified, and year/month or year/month/day. Date taken is read from JPEG, HEIC and most RAW files. Files without one use date modified."),
+    ("h3", "Rename files"),
+    ("p", "Gives your files new numbered names: original name + number, date + number, or your own name (up to 16 letters, numbers or underscores). Renaming twice with 'original name + number' adds a second number."),
+    ("h3", "Preview and Restore"),
+    ("p", "Preview shows what would happen without changing any file. Read the result in the log (Open log, bottom right). 'Restore folder' undoes the last run in the chosen folder, and pressing it again goes back to older runs. On USB drives, restoring needs the same drive letter."),
+    ("h2", "Culler"),
+    ("p", "The Culler helps you choose between similar photos. It reads JPEG, PNG, TIFF, WEBP, BMP, HEIC and most RAW files (RAW files are shown through the preview the camera saved inside them). Choose a folder and wait for the photos to be read. Photos taken close together by the same camera that look alike are stacked into groups. Photos that fit nowhere go into the 'Ungrouped' pile."),
+    ("h3", "The overview"),
+    ("p", "Click a group to open it. Hold the mouse button on a group to peek at its top photo, and let go to close the peek. Right-click or press 'Back to groups' to return. The blue number is how many photos are in a group, the green tick how many you kept."),
+    ("h3", "Inside a group"),
+    ("p", "Click a photo, or the tick box in its corner, to keep it. Click again to un-keep it. Double-click a photo to open it in its own window; that window has a Keep button, and clicking the photo closes it. Hold the mouse button on a photo to peek at it larger."),
+    ("h3", "Compare"),
+    ("p", "Keep 2 to 4 photos, then press Compare. Side by side: scroll to zoom, drag to pan, double-click to jump to full size. All photos move together, so you can check sharpness or eyes in the same spot. Blink: click or Space flips between the photos in the same spot. Slider: move the mouse across to wipe between two shots. Highlights: coloured glow where shots differ. Photos are lined up first, so small camera shake is ignored. 'Keep this one' keeps that photo and un-keeps the other compared ones."),
+    ("h3", "Delete rest"),
+    ("p", "When a group has at least one kept and one not-kept photo, 'Delete rest' moves every photo you did not keep into a 'rejected_specorde' folder. Nothing is deleted for good, and 'Restore folder' in Organize puts the photos back. It is not available for the Ungrouped pile."),
+    ("h3", "Clear kept"),
+    ("p", "Un-keeps every photo in the open group, so you can start the group again."),
+    ("h3", "The buttons at the top"),
+    ("p", "'Groups' sets how alike photos must be to share a group: Tight, Normal or Loose. The date button switches between EXIF dates (photos without one are hidden) and file dates. The camera menu shows one camera at a time. 'Density' changes the thumbnail size."),
+    ("h2", "Settings"),
+    ("p", "'Organizer Settings' has the options for duplicates, sorting and renaming. The 'Picture Modifier Settings' are for a feature that is not active yet."),
+    ("h2", "Good to know"),
+    ("p", "'Open log' (bottom right) shows what Specorde did and any problems it ran into. Your kept photos are remembered between sessions. Closing the app while a task runs is safe, because everything moved so far can be restored."),
+]
+for row, (kind, text) in enumerate(tutorial_text):
+    font, color, pady, padx = tutorial_style[kind]
+    ctk.CTkLabel(tutorial_frame, text=text, font=font, text_color=color, wraplength=540, justify="left", anchor="w").grid(row=row, column=0, sticky="w", padx=padx, pady=pady)
 
 #settings
 settings_label = ctk.CTkLabel(header, text="Settings", font=("Bahnschrift Light Condensed", 32))
@@ -2947,7 +3443,7 @@ actions_rename = ctk.CTkCheckBox(middle, text="Rename files", font=("Bahnschrift
 execute_button = ctk.CTkButton(middle, text="Execute", command=(run_execute), font=("Bahnschrift Light Condensed", 18), width=356, height=46)
 footer = ctk.CTkFrame(middle, width=678, fg_color="#20222e")
 footer.columnconfigure(0, weight=0)
-file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Cloud-only files are skipped. Most RAW and HEIC photos use date modified.", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
+file_disclaimer = ctk.CTkLabel(footer, text="DISCLAIMER: Cloud-only files are skipped. Files without a readable date taken use date modified.", text_color="grey",  font=("Bahnschrift Light Condensed", 11))
 restore_button = ctk.CTkButton(footer, text="Restore folder", font=("Bahnschrift Light Condensed", 11), command=restore_click, width=76, height=24)
 dry_run_button = ctk.CTkButton(footer, text="Preview", font=("Bahnschrift Light Condensed", 11), command=dry_run_toggle, width=52, height=24)
 
