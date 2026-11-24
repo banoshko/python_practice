@@ -14,7 +14,7 @@ import re
 import tempfile
 from logging.handlers import RotatingFileHandler
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk, ImageOps, ImageChops, ImageFilter, ImageStat
+from PIL import Image, ImageTk, ImageOps, ImageChops, ImageFilter, ImageStat, ImageEnhance, ImageDraw
 import json
 import threading
 import logging
@@ -24,6 +24,9 @@ from send2trash import send2trash
 import ctypes
 from ctypes import wintypes
 import io
+import shutil
+import math
+import numpy as np
 
 #version
 app_version = "1.1.0.0"
@@ -103,6 +106,30 @@ if tutorial_seen == 0:
 else:
     currently_open = 0  
 
+settings_file = path / "settings.json"
+settings = {}
+
+def settings_load():
+    global settings
+    try:
+        with open(settings_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        settings = data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        settings = {}
+
+def setting_get(key, default=None):
+    return settings.get(key, default)
+
+def setting_set(key, value):
+    settings[key] = value
+    tmp = settings_file.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+        os.replace(tmp, settings_file)
+    except OSError:
+        logging.exception("Could not save settings.")
 heif_suffixes = {".heic", ".heif"}
 raw_suffixes = {".cr2", ".cr3", ".nef", ".nrw", ".arw", ".dng", ".orf", ".rw2", ".raf", ".pef", ".srw"}
 exif_suffix = {".jpg", ".jpeg", ".tiff", ".tif"} | heif_suffixes | raw_suffixes
@@ -133,8 +160,8 @@ def run_execute():
     if not target_folder.is_dir():
         messagebox.showwarning("Specorde", "That folder no longer exists. Please choose it again.")
         return
-    if target_folder.name in ("sorted_specorde", "duplicates_specorde", "rejected_specorde"):
-        messagebox.showwarning("Specorde", "This is a Specorde output folder. Use 'Restore folder' to put its files back, or pick another folder.")
+    if target_folder.name in ("sorted_specorde", "duplicates_specorde", "rejected_specorde", "kept_specorde"):
+        messagebox.showwarning("Specorde", "This is a Specorde output folder. Pick the folder that contains it, then use 'Restore folder' to put its files back.")
         return
     if not dry_run:
         try:
@@ -245,6 +272,13 @@ def check_messages():
                 if reset_job is not None:
                     canvas.after_cancel(reset_job)
                 reset_job = canvas.after(1700, lambda: status.configure(text="Sitting..."))
+            elif kind == "suggest":
+                suggest_apply(*value)
+            elif kind == "suggest_progress":
+                suggest_progress(*value)
+            elif kind == "folder_reset":
+                folder_browser.configure(text="Choose a new folder")
+                folder_chosen.configure(text="...")
             elif kind == "lock":
                 execute_button.configure(fg_color="#173348", state="disabled")
                 folder_browser.configure(fg_color="#173348", state="disabled")
@@ -255,9 +289,6 @@ def check_messages():
                 folder_browser.configure(fg_color="#1f6aa5", state="normal")
                 restore_button.configure(fg_color="#1f6aa5", state="normal")
                 dry_run_button.configure(fg_color="#1f6aa5", state="normal")
-            elif kind == "folder_reset":
-                folder_browser.configure(text="Choose a new folder")
-                folder_chosen.configure(text="Folder chosen:")
     except queue.Empty: pass
     finally: canvas.after(15, check_messages)
 
@@ -637,16 +668,15 @@ def pick_folder():
         messagebox.showwarning("Specorde", "This folder is protected and can't be organized. Please pick another folder.")
         return
     target_folder = Path(chosen)
-    folder_browser.configure(text="Choose a different folder")
+    folder_browser.configure(text="Change folder")
     label_font = ctk.CTkFont(family="Bahnschrift Light Condensed", size=14)
-    max_width = 165
+    prefix = "Folder: "
     shown_name = target_folder.name or str(target_folder)
-    shown_text = f"Folder chosen: '{shown_name}'"
-    if label_font.measure(shown_text) > max_width:
-        while shown_name and label_font.measure(f"Folder chosen: '{shown_name}...'") > max_width:
+    if label_font.measure(prefix + shown_name) > 128:
+        while shown_name and label_font.measure(prefix + shown_name + "...") > 128:
             shown_name = shown_name[:-1]
-        shown_text = f"Folder chosen: '{shown_name.rstrip()}...'"
-    folder_chosen.configure(text=shown_text)
+        shown_name = shown_name.rstrip() + "..."
+    folder_chosen.configure(text=prefix + shown_name)
     frames_loaded = False
     sorted_dir = Path(target_folder/"sorted_specorde")
     duplicates = Path(target_folder/"duplicates_specorde")
@@ -1011,6 +1041,7 @@ def restore_click():
 
 def middle_reset():
     global header
+    ed_focus(False)
     try:
         for widget in header.winfo_children():
             widget.grid_forget()
@@ -1022,12 +1053,8 @@ if heif_ok:
     pic_suffixes |= heif_suffixes
 if raw_ok:
     pic_suffixes |= raw_suffixes
-if heif_ok:
-    pic_suffixes |= heif_suffixes
-if raw_ok:
-    pic_suffixes |= raw_suffixes
 view_w = 652
-view_h_base = 492
+view_h_base = 474
 grid_left = 24
 grid_gap_x = 12
 grid_top = 28
@@ -1112,6 +1139,49 @@ def raw_open(file, need=0):
         return img, 0
     return img, flip
 
+sharp_side = 1024
+sharp_tiles = 6
+sharp_top_share = 0.25
+LAPLACE = ImageFilter.Kernel((3, 3), (0, 1, 0, 1, -4, 1, 0, 1, 0), scale=4, offset=128)
+sharp_cache = {}
+sharp_lock = threading.Lock()
+suggest_token = 0
+suggest_tags = {}
+
+def sharp_measure(file):
+    img = load_image(file, (sharp_side, sharp_side), need=sharp_side, mode="L")
+    img.thumbnail((sharp_side, sharp_side), Image.BILINEAR)
+    w, h = img.size
+    lap = img.filter(LAPLACE).crop((2, 2, w - 2, h - 2))
+    lw, lh = lap.size
+    n = sharp_tiles if min(lw, lh) >= sharp_tiles * 8 else 1
+    scores = []
+    for r in range(n):
+        for c in range(n):
+            tile = lap.crop((c * lw // n, r * lh // n, (c + 1) * lw // n, (r + 1) * lh // n))
+            scores.append(ImageStat.Stat(tile).var[0])
+    scores.sort(reverse=True)
+    top = max(1, round(len(scores) * sharp_top_share))
+    return sum(scores[:top]) / top
+
+def sharp_get(file):
+    try:
+        st = file.stat()
+    except OSError:
+        return None
+    key = (str(file), st.st_size, st.st_mtime_ns)
+    with sharp_lock:
+        if key in sharp_cache:
+            return sharp_cache[key]
+    try:
+        score = sharp_measure(file)
+    except Exception:
+        logging.exception("Could not measure sharpness of %s", file.name)
+        score = None
+    with sharp_lock:
+        sharp_cache[key] = score
+    return score
+    
 def load_image(file, target, need=0, mode="RGB"):
     flip = 0
     if file.suffix.lower() in raw_suffixes:
@@ -1287,8 +1357,8 @@ def thumb_poll():
     pic_canvas.after(20, thumb_poll)
 
 photo_epoch = datetime(1970, 1, 1)
-photo_cache_file = path / "photo_cache.json"
-photo_cache_max = 50000
+photo_cache_file = path / "photo_cache_v3.json"
+photo_cache_max = 20000
 photo_info = {}
 scan_token = 0
 scan_total = 0
@@ -1340,14 +1410,47 @@ def exif_text(value):
         value = value.decode("utf-8", errors="ignore")
     return str(value).strip("\x00 ").strip()
 
-def image_hash(gray):
-    px = gray.tobytes()
-    bits = 0
-    for row in range(8):
-        for col in range(8):
-            i = row * 9 + col
-            bits = (bits << 1) | (1 if px[i] > px[i + 1] else 0)
-    return bits
+FEAT_GRAY = 256
+FEAT_LEN = FEAT_GRAY + 192
+GRAY_W = [1.0 if 3 <= i // 16 <= 12 and 3 <= i % 16 <= 12 else 0.3 for i in range(256)]
+COL_W = [1.0 if 2 <= i // 8 <= 5 and 2 <= i % 8 <= 5 else 0.3 for i in range(64)]
+GRAY_SUM = sum(GRAY_W)
+
+def image_feature(img):
+    gray = img.convert("L").resize((16, 16), Image.BOX)
+    colour = img.resize((8, 8), Image.BOX)
+    return gray.tobytes().hex() + colour.tobytes().hex()
+
+def decode_feature(text):
+    try:
+        data = bytes.fromhex(text)
+    except (TypeError, ValueError):
+        return None
+    return data if len(data) == FEAT_LEN else None
+
+def trimmed_mean(pairs, keep):
+    pairs.sort()
+    limit = sum(w for _, w in pairs) * keep
+    used = 0.0
+    total = 0.0
+    for d, w in pairs:
+        take = min(w, limit - used)
+        if take <= 0:
+            break
+        total += d * take
+        used += take
+    return total / used if used else 0.0
+
+def feature_distance(a, b, keep):
+    off = sum(w * (a[i] - b[i]) for i, w in enumerate(GRAY_W)) / GRAY_SUM
+    gray_pairs = [(abs(a[i] - b[i] - off), w) for i, w in enumerate(GRAY_W)]
+    struct_d = trimmed_mean(gray_pairs, keep)
+    col_pairs = []
+    for i, w in enumerate(COL_W):
+        j = FEAT_GRAY + i * 3
+        col_pairs.append(((abs(a[j] - b[j]) + abs(a[j + 1] - b[j + 1]) + abs(a[j + 2] - b[j + 2])) / 3, w))
+    colour_d = trimmed_mean(col_pairs, 1.0 if keep >= 1.0 else 0.9)
+    return struct_d, colour_d, abs(off)
 
 def exif_from_pillow(exif):
     try:
@@ -1404,7 +1507,6 @@ def read_photo_info(file):
             digits = "".join(ch for ch in subsec if ch.isdigit())
             if digits:
                 stamp += float("0." + digits)
-    gray = load_image(file, (64, 64), mode="L").resize((9, 8), Image.BILINEAR, reducing_gap=2.0)
     if model:
         first = make.split()[0].lower() if make else ""
         if not first or model.lower().startswith(first):
@@ -1413,7 +1515,8 @@ def read_photo_info(file):
             camera = f"{make} {model}"
     else:
         camera = make or None
-    return stamp, camera, image_hash(gray)
+    feature = image_feature(load_image(file, (160, 160)))
+    return stamp, camera, feature
 
 def scan_worker():
     while True:
@@ -1492,18 +1595,20 @@ def scan_complete():
     global copies_active
     copies_active = False
     cameras_setup()
+    state_prune()
     groups_build()
     groups_log()
     grid_clear()
     grid_update_region(grid_geometry())
     pic_canvas.yview_moveto(0)
-    if currently_open == 3:
+    if currently_open == 3 and pics_view == "grid":
         header_show()
         empty_update()
     if culler_loading.winfo_manager():
         culler_loading.grid_forget()
         overview_frame.grid(row=1, column=0, sticky="ew")
-        cutesy_bar.grid(row=2, column=0, sticky="ew")
+        cutesy_bar.grid(row=10, column=0, sticky="sew")
+        bottom_bar_update()
         schedule_refresh()
 
 def scan_poll():
@@ -1548,7 +1653,16 @@ camera_names = []
 camera_choice = all_cameras
 group_names = ("Tight", "Normal", "Loose")
 group_gaps = (3.0, 8.0, 20.0)
-group_limits = (6, 12, 20)
+group_limits = (6.0, 9.0, 13.0)
+group_colours = (9.0, 14.0, 20.0)
+group_bright = (18.0, 28.0, 42.0)
+group_keep = (0.85, 0.75, 0.65)
+strict_struct = 1.5
+strict_colour = 4.0
+strict_bright = 6.0
+strict_gap = 3.0
+anchor_limit = 1.7
+pick_hard = 1.25
 group_level = 1
 time_mode = 0
 hidden_no_exif = 0
@@ -1559,6 +1673,40 @@ open_idx = None
 saved_top = 0.0
 hover_idx = None
 keep_file = path / "keeps.json"
+done_file = path / "done.json"
+
+def done_load():
+    try:
+        with open(done_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {item for item in data if isinstance(item, str)} if isinstance(data, list) else set()
+
+done_set = done_load()
+
+def done_save():
+    tmp = done_file.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(done_set), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, done_file)
+    except OSError:
+        logging.exception("Could not save the done list.")
+
+def group_is_done(idx):
+    return idx != other_idx and idx < len(groups) and all(str(f) in done_set for f in groups[idx])
+
+def done_set_group(idx, value):
+    files = [str(f) for f in groups[idx]]
+    if value:
+        done_set.update(files)
+    else:
+        done_set.difference_update(files)
+    done_save()
+
 
 def keep_load():
     try:
@@ -1573,7 +1721,17 @@ def keep_load():
         return set()
     return {item for item in data if isinstance(item, str)}
 
+
+
 keep_set = keep_load()
+
+def state_prune():
+    folder = str(target_folder)
+    for store, save in ((keep_set, keep_save), (done_set, done_save)):
+        stale = {k for k in store if os.path.dirname(k) == folder and not os.path.exists(k)}
+        if stale:
+            store.difference_update(stale)
+            save()
 
 def keep_save():
     tmp = keep_file.with_suffix(".tmp")
@@ -1621,10 +1779,48 @@ def cameras_setup():
         culler_camera_menu.configure(values=[all_cameras] + camera_names)
         culler_camera_menu.set(all_cameras)
 
-def similar(a, b, limit):
-    if a is None or b is None:
-        return False
-    return bin(a ^ b).count("1") <= limit
+NAME_DATE_RE = re.compile(r"((?:19|20)\d{2})[-_.]?(\d{2})[-_.]?(\d{2})(?:[-_. T]?(\d{2})[-_.]?(\d{2})[-_.]?(\d{2}))?")
+
+def guess_time(file, stamp, modified):
+    if stamp is not None:
+        return stamp
+    m = NAME_DATE_RE.search(file.stem)
+    if m:
+        parts = [int(x) if x else 0 for x in m.groups()]
+        try:
+            return (datetime(*parts) - photo_epoch).total_seconds()
+        except ValueError:
+            pass
+    return (datetime.fromtimestamp(modified) - photo_epoch).total_seconds()
+
+def pair_score(a, b, strict, dt, max_gap):
+    keep = 1.0 if strict else group_keep[group_level]
+    struct_d, colour_d, bright_d = feature_distance(a, b, keep)
+    if strict:
+        lim = (strict_struct, strict_colour, strict_bright)
+    else:
+        lim = (group_limits[group_level], group_colours[group_level], group_bright[group_level])
+    pic = max(struct_d / lim[0], colour_d / lim[1], bright_d / lim[2])
+    return pic, 0.85 * pic + 0.15 * min(dt / max_gap, 2.0)
+
+def singles_sorted():
+    files = [f for f in scan_order if f not in copy_hidden and (camera_choice == all_cameras or camera_of(f) == camera_choice)]
+    if all_sort == "Date":
+        def stamp(f):
+            info = photo_info.get(f)
+            return guess_time(f, info[0], info[3]) if info else 0.0
+        files.sort(key=lambda f: (stamp(f), f.name.lower()))
+    elif all_sort == "Camera":
+        files.sort(key=lambda f: (camera_of(f).lower(), f.name.lower()))
+    return files
+
+def cards_rebuild():
+    global cards, pending_pics
+    if pics_mode == "all":
+        cards = [[f] for f in singles_sorted()]
+    else:
+        cards = groups
+    pending_pics = [c[0] for c in cards]
 
 def groups_build():
     global groups
@@ -1634,45 +1830,61 @@ def groups_build():
     global other_idx
     global hidden_no_exif
     gap = group_gaps[group_level]
-    limit = group_limits[group_level]
     by_camera = {}
+    extra = []
     hidden_no_exif = 0
     for file in scan_order:
         if file in copy_hidden:
             continue
         info = photo_info.get(file)
-        if info is None or info[4]:
-            continue
-        stamp, camera, dhash, modified, failed = info
-        name = camera_of(file)
+        name = camera_of(file) if info else unknown_camera
         if camera_choice != all_cameras and name != camera_choice:
             continue
+        if info is None or info[4]:
+            extra.append(file)
+            continue
+        stamp, camera, dhash, modified, failed = info
+        feature = decode_feature(dhash) if dhash else None
         if time_mode == 1:
-            stamp = modified
+            stamp = guess_time(file, stamp, modified)
         elif stamp is None:
             hidden_no_exif += 1
+            extra.append(file)
             continue
-        by_camera.setdefault(name, []).append((stamp, file.name.lower(), file, dhash))
+        if feature is None:
+            extra.append(file)
+            continue
+        by_camera.setdefault(name, []).append((stamp, file.name.lower(), file, feature))
     built = []
     for name, items in by_camera.items():
+        strict = name == unknown_camera
+        max_gap = min(gap, strict_gap) if strict else gap
         items.sort(key=lambda t: (t[0], t[1]))
         current = None
-        last_stamp = None
-        last_hash = None
-        first_hash = None
-        for stamp, file_name, file, dhash in items:
-            near = last_stamp is not None and stamp - last_stamp <= gap
-            if current is not None and near and similar(last_hash, dhash, limit) and similar(first_hash, dhash, limit + 8):
+        last_stamp = 0.0
+        first = None
+        recent = []
+        for stamp, file_name, file, feature in items:
+            joined = False
+            dt = stamp - last_stamp
+            if current is not None and 0 <= dt <= 2 * max_gap:
+                for other in recent:
+                    pic, total = pair_score(other, feature, strict, dt, max_gap)
+                    if pic <= pick_hard and total <= 1.0:
+                        joined = pair_score(first, feature, strict, dt, max_gap)[0] <= anchor_limit
+                        break
+            if joined:
                 current[1].append(file)
+                recent = (recent + [feature])[-3:]
             else:
                 current = [stamp, [file]]
                 built.append(current)
-                first_hash = dhash
+                first = feature
+                recent = [feature]
             last_stamp = stamp
-            last_hash = dhash
     built.sort(key=lambda g: g[0])
     multi = [g[1] for g in built if len(g[1]) >= 2]
-    singles = [g[1][0] for g in built if len(g[1]) == 1]
+    singles = [g[1][0] for g in built if len(g[1]) == 1] + extra
     groups = multi
     other_idx = None
     if singles:
@@ -1682,10 +1894,12 @@ def groups_build():
         else:
             groups = multi + [singles]
             other_idx = len(groups) - 1
-    cards = groups
-    pending_pics = [g[0] for g in groups]
     open_idx = None
+    cards_rebuild()
     time_button_update()
+
+def time_button_update():
+    culler_time_button.configure(text="Dates: file" if time_mode == 1 else "Dates: EXIF")
 
 def groups_log():
     total = sum(len(g) for g in groups)
@@ -1700,21 +1914,13 @@ def groups_log():
         q.put(("summary_add", f"○ {n} exact cop{'y' if n == 1 else 'ies'} hidden."))
         q.put(("summary_hide_later", None))
 
-def time_button_update():
-    if time_mode == 1:
-        text = "File dates · all photos"
-    elif hidden_no_exif:
-        text = f"EXIF dates · {hidden_no_exif} hidden"
-    else:
-        text = "EXIF dates only"
-    culler_time_button.configure(text=text)
-
 def groups_show():
     grid_clear()
     grid_update_region(grid_geometry())
     pic_canvas.yview_moveto(0)
     empty_update()
     schedule_refresh()
+    bottom_bar_update()
 
 def camera_changed(choice):
     global camera_choice
@@ -1725,6 +1931,37 @@ def camera_changed(choice):
     groups_log()
     groups_show()
 
+def pics_mode_set(value):
+    global pics_mode
+    new = "all" if value == "All photos" else "groups"
+    if new == pics_mode:
+        return
+    if scan_active or copies_active:
+        culler_mode_switch.set("All photos" if pics_mode == "all" else "Groups")
+        return
+    if open_idx is not None:
+        group_close()
+    pics_mode = new
+    marq_sel.clear()
+    hover_clear()
+    inspect_close_all()
+    compare_close()
+    peek_close()
+    sel_hide()
+    cards_rebuild()
+    header_show()
+    groups_show()
+
+def sort_cycle():
+    global all_sort
+    if scan_active or copies_active:
+        return
+    names = ("Name", "Date", "Camera")
+    all_sort = names[(names.index(all_sort) + 1) % 3]
+    culler_sort_button.configure(text=f"Sort: {all_sort}")
+    cards_rebuild()
+    groups_show()
+    
 def groups_cycle():
     global group_level
     group_level = (group_level + 1) % 3
@@ -1734,6 +1971,21 @@ def groups_cycle():
     groups_build()
     groups_log()
     groups_show()
+
+size_names = ("High", "Medium", "Low")
+
+def pictures_size():
+    global size
+    if scan_active or copies_active:
+        return
+    size = (size + 1) % 3
+    culler_size_changer.configure(text=f"Density: {size_names[size]}")
+    hover_clear()
+    grid_clear()
+    grid_update_region(grid_geometry())
+    pic_canvas.yview_moveto(0)
+    schedule_refresh()
+    sel_scroll_into_view()
 
 def time_toggle():
     global time_mode
@@ -1746,21 +1998,26 @@ def time_toggle():
 
 def camera_menu_show():
     if len(camera_names) > 1:
-        culler_camera_menu.grid(row=1, column=0, sticky="w", padx=(16,8), pady=8)
+        culler_camera_menu.grid(row=0, column=0, padx=(0, 8))
     else:
         culler_camera_menu.grid_forget()
 
 def header_show():
     if open_idx is None:
-        culler_back_button.grid_forget()
         culler_group_tools.grid_forget()
-        culler_tools.grid(row=1, column=1, sticky="e", padx=(0,12), pady=8)
+        culler_tools.grid(row=1, column=0, columnspan=3, sticky="w", padx=(16, 0), pady=10)
+        if pics_mode == "all":
+            culler_groups_button.grid_forget()
+            culler_time_button.grid_forget()
+            culler_sort_button.grid(row=0, column=1, padx=(0, 6))
+        else:
+            culler_sort_button.grid_forget()
+            culler_groups_button.grid(row=0, column=1, padx=(0, 6))
+            culler_time_button.grid(row=0, column=2, padx=(0, 6))
         camera_menu_show()
     else:
         culler_tools.grid_forget()
-        culler_camera_menu.grid_forget()
-        culler_back_button.grid(row=1, column=0, sticky="w", padx=(16,8), pady=10)
-        culler_group_tools.grid(row=1, column=1, sticky="e", padx=(0,12), pady=10)
+        culler_group_tools.grid(row=1, column=0, columnspan=3, sticky="w", padx=(16, 0), pady=10)
         group_buttons_update()
 
 def empty_update():
@@ -1785,38 +2042,6 @@ def group_title(idx):
     total = len(groups) - (1 if other_idx is not None else 0)
     return f"Group {number} of {total} · {count} photo{plural}"
 
-def group_open(idx):
-    global cards
-    global pending_pics
-    global open_idx
-    global saved_top
-    saved_top = pic_canvas.yview()[0]
-    open_idx = idx
-    cards = [[f] for f in groups[idx]]
-    pending_pics = [c[0] for c in cards]
-    culler_info_label.configure(text=group_title(idx))
-    header_show()
-    groups_show()
-    inspect_preload(idx)
-
-def group_close(event=None):
-    global cards
-    global pending_pics
-    global open_idx
-    if open_idx is None:
-        return
-    click_cancel()
-    inspect_close_all()
-    compare_close()
-    peek_close()
-    open_idx = None
-    cards = groups
-    pending_pics = [c[0] for c in cards]
-    header_show()
-    grid_clear()
-    grid_update_region(grid_geometry())
-    pic_canvas.yview_moveto(saved_top)
-    schedule_refresh()
 
 def stack_rects(idx, geo):
     row, col = divmod(idx, geo["per_row"])
@@ -1839,15 +2064,20 @@ def badge_draw(idx, rect, geo):
     left, top, w, h = rect
     s = geo["s"]
     items = []
+    grouped = at_groups()
     font = ("Bahnschrift Light Condensed", -round(15 * s), "bold")
-    if open_idx is None and idx == other_idx:
+    if grouped and idx == other_idx:
         bar_h = 24 * s
         items.append(pic_canvas.create_rectangle(left, top + h - bar_h, left + w, top + h, fill="#173348", outline=""))
         items.append(pic_canvas.create_text(left + w / 2, top + h - bar_h / 2, text=f"UNGROUPED · {len(card)}", fill="white", font=font))
-    elif open_idx is None and len(card) >= 2:
+    elif grouped and len(card) >= 2:
         text = str(len(card))
         pill_draw(items, left + w - 6 * s - (14 + 8 * len(text)) * s, top + 6 * s, text, "#1f6aa5", s, font)
-    if open_idx is None:
+    if grouped and idx != other_idx and group_is_done(idx):
+        bar_h = 24 * s
+        items.append(pic_canvas.create_rectangle(left, top + h - bar_h, left + w, top + h, fill="#2e8b57", outline=""))
+        items.append(pic_canvas.create_text(left + w / 2, top + h - bar_h / 2, text="FINISHED ✓", fill="white", font=font))
+    if grouped:
         kept = sum(1 for f in card if str(f) in keep_set)
         if kept:
             pill_draw(items, left + 6 * s, top + 6 * s, f"✓ {kept}", "#2e8b57", s, font)
@@ -1859,6 +2089,12 @@ def badge_draw(idx, rect, geo):
         items.append(pic_canvas.create_rectangle(x1, y1, x1 + box, y1 + box, fill="#2e8b57" if is_kept else "#101117", outline="white", width=2))
         if is_kept:
             items.append(pic_canvas.create_text(x1 + box / 2, y1 + box / 2, text="✓", fill="white", font=font))
+        tag = suggest_tags.get(card[0])
+        if tag:
+            if tag == "best":
+                items.append(pic_canvas.create_rectangle(left, top, left + w, top + h, outline=BEST_COLOR, width=4))
+            text, color = ("★", BEST_COLOR) if tag == "best" else ("SOFT", SOFT_COLOR)
+            pill_draw(items, left + w - 6 * s - (14 + 8 * len(text)) * s, top + 6 * s, text, color, s, font)
     if items:
         pic_badges[idx] = items
 
@@ -1886,9 +2122,19 @@ def cell_make(idx, geo):
     for layer in range(len(rects)):
         thumb_request((idx, layer))
 
+def badge_refresh(idx):
+    if (idx, 0) not in pic_cells:
+        return
+    for item_id in pic_badges.pop(idx, ()):
+        pic_canvas.delete(item_id)
+    geo = grid_geometry()
+    badge_draw(idx, stack_rects(idx, geo)[0], geo)
+    pic_canvas.tag_raise("sel")
+
 def card_redraw(idx):
     cell_remove(idx)
     cell_make(idx, grid_geometry())
+    pic_canvas.tag_raise("sel")
 
 def grid_clear():
     global hover_idx
@@ -1912,6 +2158,73 @@ def folder_stamp():
     except OSError:
         return None
 
+sessions_file = path / "sessions.json"
+session_folder = None
+
+def sessions_load():
+    try:
+        with open(sessions_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+sessions = sessions_load()
+
+def sessions_save():
+    tmp = sessions_file.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sessions, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, sessions_file)
+    except OSError:
+        logging.exception("Could not save the session list.")
+
+def folder_cache_info():
+    folder = str(target_folder)
+    kept = sum(1 for k in keep_set if os.path.dirname(k) == folder)
+    finished = sum(1 for k in done_set if os.path.dirname(k) == folder)
+    scanned = sum(1 for k in photo_cache if os.path.dirname(k) == folder)
+    return kept, finished, scanned
+
+def folder_cache_clear():
+    folder = str(target_folder)
+    for store, save in ((keep_set, keep_save), (done_set, done_save)):
+        stale = {k for k in store if os.path.dirname(k) == folder}
+        if stale:
+            store.difference_update(stale)
+            save()
+    old = [k for k in photo_cache if os.path.dirname(k) == folder]
+    for k in old:
+        del photo_cache[k]
+    if old:
+        cache_save(dict(photo_cache))
+    sessions.pop(folder, None)
+    sessions_save()
+    logging.info("Cleared saved data for %s (%d scanned photos).", folder, len(old))
+
+def folder_cache_ask():
+    global session_folder
+    if session_folder == target_folder:
+        return True
+    folder = str(target_folder)
+    kept, finished, scanned = folder_cache_info()
+    if kept or finished or scanned:
+        opened = sessions.get(folder)
+        when = f"\nLast opened: {opened}." if opened else ""
+        name = target_folder.name or str(target_folder)
+        choice = messagebox.askyesnocancel("Specorde", f"Saved progress found for '{name}': {scanned} photos read, {kept} kept, {finished} in finished groups.{when}\n\nYes = continue where you left off\nNo = start over (clears the marks and the saved scan for this folder)\nCancel = don't open this folder now")
+        if choice is None:
+            return False
+        if choice is False:
+            folder_cache_clear()
+    session_folder = target_folder
+    sessions[folder] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sessions_save()
+    return True
+
 def grid_load_folder():
     global pending_pics
     global pics_folder
@@ -1934,8 +2247,27 @@ def grid_load_folder():
     global hidden_no_exif
     pics_folder = target_folder
     pics_stamp = folder_stamp()
+    marq_sel.clear()
+    if not folder_cache_ask():
+        scan_token += 1
+        scan_active = False
+        copies_active = False
+        pics_folder = None
+        pending_pics = []
+        groups = []
+        cards = []
+        open_idx = None
+        inspect_close_all()
+        header_show()
+        grid_clear()
+        culler_loading.grid_forget()
+        overview_frame.grid_forget()
+        cutesy_bar.grid_forget()
+        culler_empty.configure(text="Cancelled. Press Culler again to open this folder.")
+        culler_empty.grid(row=1, pady=60)
+        return
     try:
-        pics = [p for p in target_folder.iterdir() if p.is_file() and p.suffix.lower() in pic_suffixes]
+        pics = [p for p in target_folder.iterdir() if p.is_file() and p.suffix.lower() in pic_suffixes and not is_protected_item(p)]
     except OSError:
         logging.exception("Could not read pictures from %s", target_folder)
         pics = []
@@ -2007,6 +2339,9 @@ def grid_refresh():
 
     for idx in new_idxs:
         cell_make(idx, geo)
+    sel_draw()
+    banner_draw()
+    marq_draw()
 
 def schedule_refresh():
     global grid_job
@@ -2053,6 +2388,8 @@ def pic_hover(event):
     idx = card_at(event)
     if idx == hover_idx:
         return
+    if idx is not None and sel_visible:
+        sel_hide()
     hover_idx = idx
     pic_canvas.delete("hover")
     if idx is None:
@@ -2072,6 +2409,16 @@ press_x = 0
 press_y = 0
 last_click_time = 0.0
 press_on_tick = False
+marq_sel = set()
+marq_base = set()
+marq_on = False
+marq_add = False
+marq_x0 = 0.0
+marq_y0 = 0.0
+marq_last = -1
+pics_mode = "all"
+all_sort = "Name"
+move_limit = 8
 tick_box = 26
 tick_zone = 38
 inspect_buttons = {}
@@ -2086,6 +2433,8 @@ inspect_windows = []
 inspect_by_file = {}
 rejected_name = "rejected_specorde"
 UI_FONT = "Bahnschrift Light Condensed"
+sel_idx = None
+sel_visible = False
 
 def center_on_main(win, offset=0):
     win.update_idletasks()
@@ -2126,30 +2475,50 @@ def clear_kept():
     for f in kept:
         keep_refresh(f)
 
+btn_state = {}
+
+def btn_set(button, **new):
+    old = btn_state.setdefault(button, {})
+    changed = {k: v for k, v in new.items() if old.get(k) != v}
+    if changed:
+        old.update(changed)
+        button.configure(**changed)
+
+def bottom_bar_update():
+    n = len(marq_sel)
+    kept = kept_count()
+    if n:
+        text = f"{n} selected · {kept} kept"
+    elif at_singles():
+        text = f"{kept} kept · drag to select photos"
+    else:
+        text = f"{kept} kept"
+    if bar_info.cget("text") != text:
+        bar_info.configure(text=text)
+    if n and not bar_keep_button.winfo_ismapped():
+        bar_keep_button.grid(row=0, column=1, padx=(0, 6), pady=5)
+        bar_unkeep_button.grid(row=0, column=2, padx=(0, 6), pady=5)
+        bar_clear_button.grid(row=0, column=3, padx=(0, 6), pady=5)
+    elif not n and bar_keep_button.winfo_ismapped():
+        bar_keep_button.grid_forget()
+        bar_unkeep_button.grid_forget()
+        bar_clear_button.grid_forget()
+    can_edit = at_singles() and bool(cards)
+    btn_set(bar_edit_button, state="normal" if can_edit else "disabled", fg_color="#1f6aa5" if can_edit else IDLE_COLOR)
+    btn_set(bar_bulk_button, text=f"Bulk edit ({n or kept})")
+    can_wrap = open_idx is None
+    btn_set(bar_wrap_button, state="normal" if can_wrap else "disabled", fg_color="#1f6aa5" if can_wrap else IDLE_COLOR)
+
 def group_buttons_update():
     if open_idx is None:
         return
     kept, rest = group_kept_files()
     can_compare = 2 <= len(kept) <= 4
-    culler_compare_button.configure(text=f"Compare ({len(kept)})", state="normal" if can_compare else "disabled", fg_color="#1f6aa5" if can_compare else "#173348")
-    can_delete = bool(kept) and bool(rest)
-    culler_clear_button.configure(state="normal" if kept else "disabled", fg_color="#1f6aa5" if kept else "#173348")
-    culler_delete_button.configure(state="normal" if can_delete else "disabled", fg_color="#8b2e2e" if can_delete else "#173348")
-    if open_idx == other_idx:
-        culler_delete_button.grid_remove()
-    else:
-        culler_delete_button.grid()
-
-def inspect_close(win):
-    if win in inspect_windows:
-        inspect_windows.remove(win)
-    for key in [k for k, v in inspect_by_file.items() if v is win]:
-        del inspect_by_file[key]
-        inspect_buttons.pop(key, None)
-    try:
-        win.destroy()
-    except Exception:
-        pass
+    btn_set(culler_compare_button, text="Compare" if len(kept) < 2 else f"Compare {len(kept)}", state="normal" if can_compare else "disabled", fg_color="#1f6aa5" if can_compare else "#173348")
+    btn_set(culler_clear_button, state="normal" if kept else "disabled", fg_color="#1f6aa5" if kept else "#173348")
+    can_delete = bool(kept) and bool(rest) and open_idx != other_idx
+    btn_set(culler_delete_button, state="normal" if can_delete else "disabled", fg_color="#8b2e2e" if can_delete else "#173348")
+    suggest_button_update()
 
 def inspect_close_all():
     for win in list(inspect_windows):
@@ -2253,56 +2622,6 @@ def place_at_mouse(win, x, y):
     apply()
     win.after(30, apply)
     win.after(350, apply)
-def inspect_show(idx, x=None, y=None):
-    if idx >= len(cards):
-        return
-    file = cards[idx][0]
-    existing = inspect_by_file.get(file)
-    if existing is not None:
-        try:
-            if existing.winfo_exists():
-                existing.lift()
-                return
-        except Exception:
-            pass
-    img = inspect_load(file)
-    if img is None:
-        return
-    hover_clear()
-    photo = ImageTk.PhotoImage(img)
-
-    win = ctk.CTkToplevel(canvas)
-    win.withdraw()
-    win.title(file.name)
-    win.configure(fg_color="#101117")
-    win.resizable(False, False)
-    win.transient(canvas)
-    win.protocol("WM_DELETE_WINDOW", lambda: inspect_close(win))
-
-    frame = tk.Frame(win, bg="#101117", highlightbackground=card_edge, highlightthickness=2, bd=0)
-    frame.grid(row=0, column=0, padx=14, pady=(14, 6))
-    label = tk.Label(frame, image=photo, bd=0, bg="#101117", cursor="hand2")
-    label.image = photo
-    label.grid(padx=5, pady=5)
-    label.bind("<ButtonRelease-1>", lambda e: inspect_close(win))
-    tk.Label(win, text=f"{file.name}   ·   click the photo to close", bg="#101117", fg="#c8ccd8", font=(UI_FONT, 12)).grid(row=1, column=0)
-
-    def toggle():
-        lock_toggle(file)
-        keep_refresh(file)
-
-    keep_button = ctk.CTkButton(win, text=keep_text(file), command=toggle, font=(UI_FONT, 16), width=120, height=30)
-    keep_button.grid(row=2, column=0, pady=(8, 12))
-    inspect_buttons[file] = keep_button
-    
-    if x is None:
-        center_on_main(win, 28 * len(inspect_windows))
-    else:
-        place_at_mouse(win, x, y)
-    inspect_windows.append(win)
-    inspect_by_file[file] = win
-    win.after(300, lambda: set_inspect_icon(win))
-    win.after(60, lambda: reveal(win))
 
 def peek_start():
     global press_job, peek_window
@@ -2339,22 +2658,149 @@ def tick_hit(event, idx):
     zone = tick_zone * geo["s"]
     return left <= x <= left + zone and top <= y <= top + zone
 
+def at_groups():
+    return open_idx is None and pics_mode == "groups"
+
+def at_singles():
+    return not at_groups()
+
+def kept_count():
+    if "target_folder" not in globals():
+        return 0
+    folder = str(target_folder)
+    return sum(1 for k in keep_set if os.path.dirname(k) == folder)
+
+def marq_hits(x1, y1, x2, y2):
+    geo = grid_geometry()
+    r0 = max(0, int((y1 - geo["top"]) // geo["pitch"]))
+    r1 = int((y2 - geo["top"]) // geo["pitch"])
+    out = []
+    for row in range(r0, r1 + 1):
+        for col in range(geo["per_row"]):
+            idx = row * geo["per_row"] + col
+            if idx >= len(cards):
+                break
+            l, t, w, h = stack_rects(idx, geo)[0]
+            if l < x2 and l + w > x1 and t < y2 and t + h > y1:
+                out.append(idx)
+    return out
+
+def marq_draw():
+    pic_canvas.delete("msel")
+    if not marq_sel or not cards or at_groups():
+        return
+    geo = grid_geometry()
+    top = pic_canvas.canvasy(0)
+    view_h = grid_view_h(geo)
+    r0 = max(0, int((top - geo["slot0"]) // geo["pitch"]))
+    r1 = int((top + view_h - geo["slot0"]) // geo["pitch"])
+    pad = 3 * geo["s"]
+    for idx in range(r0 * geo["per_row"], min((r1 + 1) * geo["per_row"], len(cards))):
+        if cards[idx][0] in marq_sel:
+            l, t, w, h = stack_rects(idx, geo)[0]
+            pic_canvas.create_rectangle(l - pad, t - pad, l + w + pad, t + h + pad, outline="#4da3ff", width=3, tags="msel")
+
+def rubber_draw(x, y):
+    pic_canvas.delete("rubber")
+    pic_canvas.create_rectangle(marq_x0, marq_y0, x, y, outline="#4da3ff", fill="#4da3ff", stipple="gray25", tags="rubber")
+
+def marq_clear():
+    marq_sel.clear()
+    pic_canvas.delete("msel")
+    pic_canvas.delete("rubber")
+    bottom_bar_update()
+
+def marq_all():
+    marq_sel.clear()
+    marq_sel.update(c[0] for c in cards)
+    marq_draw()
+    bottom_bar_update()
+    return "break"
+
+def marq_keep(value):
+    changed = False
+    for card in cards:
+        key = str(card[0])
+        if card[0] in marq_sel and (key in keep_set) != value:
+            if value:
+                keep_set.add(key)
+            else:
+                keep_set.discard(key)
+            changed = True
+    if changed:
+        keep_save_later()
+        for i in range(len(cards)):
+            if (i, 0) in pic_cells:
+                badge_refresh(i)
+        group_buttons_update()
+    bottom_bar_update()
+
 def pic_press(event):
-    global press_job, press_idx, press_x, press_y, press_on_tick
+    global press_job, press_idx, press_x, press_y, press_on_tick, marq_on, marq_x0, marq_y0, marq_add
+    canvas.focus_set()
+    sel_hide()
     peek_close()
+    marq_on = False
+    marq_x0 = pic_canvas.canvasx(event.x)
+    marq_y0 = pic_canvas.canvasy(event.y)
+    marq_add = bool(event.state & 0x4)
     press_idx = card_at(event)
     press_x = event.x_root
     press_y = event.y_root
-    press_on_tick = open_idx is not None and press_idx is not None and tick_hit(event, press_idx)
+    press_on_tick = at_singles() and press_idx is not None and tick_hit(event, press_idx)
     if press_idx is not None and not press_on_tick:
         press_job = pic_canvas.after(hold_ms, peek_start)
 
+def pic_drag(event):
+    global press_job, press_idx, marq_on, marq_base, marq_last
+    if peek_window is not None:
+        return
+    if not marq_on:
+        if math.hypot(event.x_root - press_x, event.y_root - press_y) < move_limit:
+            return
+        if press_job is not None:
+            pic_canvas.after_cancel(press_job)
+            press_job = None
+        if at_groups():
+            press_idx = None
+            return
+        marq_on = True
+        marq_last = -1
+        marq_base = set(marq_sel) if marq_add else set()
+        hover_clear()
+        click_cancel()
+    view_h = pic_canvas.winfo_height()
+    if pic_total_h > view_h:
+        step = -24 if event.y < 24 else 24 if event.y > view_h - 24 else 0
+        if step:
+            new_top = max(0, min(pic_canvas.canvasy(0) + step, pic_total_h - view_h))
+            pic_canvas.yview_moveto(new_top / pic_total_h)
+    x = pic_canvas.canvasx(event.x)
+    y = pic_canvas.canvasy(event.y)
+    left, right = sorted((marq_x0, x))
+    top, bottom = sorted((marq_y0, y))
+    hit = {cards[i][0] for i in marq_hits(left, top, right, bottom)}
+    marq_sel.clear()
+    marq_sel.update(marq_base | hit)
+    rubber_draw(x, y)
+    marq_draw()
+    if len(marq_sel) != marq_last:
+        marq_last = len(marq_sel)
+        bottom_bar_update()
+
 def pic_release(event):
-    global press_job, press_idx, last_click_idx, last_click_time, press_on_tick
+    global press_job, press_idx, last_click_idx, last_click_time, press_on_tick, marq_on
     if peek_window is not None:
         peek_close()
         press_idx = None
         press_on_tick = False
+        return
+    if marq_on:
+        marq_on = False
+        pic_canvas.delete("rubber")
+        press_idx = None
+        press_on_tick = False
+        bottom_bar_update()
         return
     if press_job is not None:
         pic_canvas.after_cancel(press_job)
@@ -2364,9 +2810,12 @@ def pic_release(event):
     on_tick = press_on_tick
     press_idx = None
     press_on_tick = False
+    if idx is None and started is None and marq_sel:
+        marq_clear()
+        return
     if idx is None or idx != started:
         return
-    if open_idx is None:
+    if at_groups():
         group_open(idx)
         return
     if on_tick and tick_hit(event, idx):
@@ -2385,8 +2834,8 @@ def pic_release(event):
 
 def keep_refresh(file):
     i = card_index_of(file)
-    if i is not None and (i, 0) in pic_cells:
-        card_redraw(i)
+    if i is not None:
+        badge_refresh(i)
     button = inspect_buttons.get(file)
     if button is not None:
         try:
@@ -2394,6 +2843,7 @@ def keep_refresh(file):
         except Exception:
             inspect_buttons.pop(file, None)
     group_buttons_update()
+    bottom_bar_update()
 
 def keep_flip(idx):
     file = cards[idx][0]
@@ -2408,6 +2858,7 @@ def compare_close(event=None):
         except Exception:
             pass
         compare_window = None
+        main_focus_later()
 
 def shift_search(a, b, cx, cy, radius):
     w, h = a.size
@@ -2505,9 +2956,9 @@ COMPARE_MODES = ("Side by side", "Blink", "Slider", "Highlights")
 DIFF_MODES = ("Highlights",)
 PAD_COLOR = "#101117"
 MODE_HELP = {
-    "Side by side": "Scroll to zoom, drag to pan, double-click to jump to full size. All photos move together. 'Keep this one' keeps that photo and un-keeps the other compared ones.",
-    "Slider": "Move the mouse across the photo to wipe from one shot to the other.",
-    "Highlights": "Coloured glow where the shots differ. Shots are lined up first, so camera shake is ignored.",
+    "Side by side": "Scroll to zoom · drag to pan · A D pick · R keeps",
+    "Slider": "",
+    "Highlights": "Glow = where the shots differ",
 }
 zoom_source_side = 4000
 zoom_step = 1.25
@@ -2554,17 +3005,21 @@ def compare_open():
 
     modes = ctk.CTkFrame(win, fg_color="transparent")
     modes.grid(row=0, column=0, pady=(12, 4))
-    view = tk.Frame(win, bg=PAD_COLOR)
-    view.grid(row=1, column=0, padx=16, pady=4)
-    caption = tk.Label(win, text="", bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12), wraplength=max_w, justify="center")
+    stage = tk.Frame(win, bg=PAD_COLOR, width=max_w + 32, height=max_h + 96)
+    stage.grid(row=1, column=0, padx=16, pady=4)
+    view = tk.Frame(stage, bg=PAD_COLOR)
+    view.place(relx=0.5, rely=0.5, anchor="center")
+    caption = tk.Label(win, text="", bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12), wraplength=max_w, justify="center", height=2)
     caption.grid(row=2, column=0, pady=(2, 4))
-    legend_frame = tk.Frame(win, bg=PAD_COLOR)
-    legend_frame.grid(row=3, column=0, pady=(0, 12))
-    state = {"mode": "Side by side", "blink": 0, "pair": 0, "label": None, "diff": None, "busy": False, "views": {}, "zoom": 1.0, "cx": 0.5, "cy": 0.5, "src": list(originals), "cells": [], "shown": [], "drag": None, "side_job": None}
+    legend_box = tk.Frame(win, bg=PAD_COLOR, width=max_w, height=30)
+    legend_box.grid(row=3, column=0, pady=(0, 12))
+    legend_frame = tk.Frame(legend_box, bg=PAD_COLOR)
+    legend_frame.place(relx=0.5, rely=0.5, anchor="center")
+    state = {"mode": "Side by side", "blink": 0, "pair": 0, "label": None, "diff": None, "busy": False, "views": {}, "zoom": 1.0, "cx": 0.5, "cy": 0.5, "src": list(originals), "pick": 0, "cells": [], "shown": [], "drag": None, "side_job": None}
 
     def blink_caption():
         i = state["blink"]
-        caption.configure(text=f"Blink · {trim(names[i])} ({i + 1} of {n}) · click the photo or press Space to flip")
+        caption.configure(text=f"{trim(names[i])}  ({i + 1}/{n})")
 
     def flip(event=None):
         if state["mode"] != "Blink" or state["label"] is None:
@@ -2771,8 +3226,8 @@ def compare_open():
         cv.bind("<B1-Motion>", lambda e: wipe(e.x))
         wipe(wd // 2)
         if n > 2:
-            ctk.CTkButton(view, text="Next pair", width=100, height=24, font=(UI_FONT, 14), command=next_pair).grid(row=1, column=0, pady=(8, 0))
-        caption.configure(text=f"Slider · {trim(names[k])} on the left, {trim(names[k + 1])} on the right · {MODE_HELP['Slider']}")
+            ctk.CTkButton(view, text="Next pair", width=100, height=24, corner_radius=0, fg_color="#1f2029", hover_color="#2c3043", font=(UI_FONT, 14), command=next_pair).grid(row=1, column=0, pady=(8, 0))
+        caption.configure(text=f"{trim(names[k])}   |   {trim(names[k + 1])}")
 
     def draw():
         state["cells"] = []
@@ -2785,7 +3240,7 @@ def compare_open():
         if mode == "Side by side":
             cells = []
             for i, f in enumerate(kept):
-                col = tk.Frame(view, bg=PAD_COLOR, highlightbackground=card_edge, highlightthickness=2, bd=0)
+                col = tk.Frame(view, bg=PAD_COLOR, highlightbackground="#ffd24a" if i == state["pick"] else PAD_COLOR, highlightthickness=2, bd=0)
                 col.grid(row=0, column=i, padx=6, sticky="n")
                 dw = side_photos[i].width()
                 dh = side_photos[i].height()
@@ -2798,7 +3253,7 @@ def compare_open():
                 cell.bind("<Double-Button-1>", lambda e, i=i: side_toggle(e, i))
                 cells.append((cell, item, dw, dh))
                 tk.Label(col, text=trim(f.name), bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12)).grid()
-                ctk.CTkButton(col, text="Keep this one", width=100, height=22, font=(UI_FONT, 13), command=lambda f=f: choose(f)).grid(pady=6)
+                ctk.CTkButton(col, text="Keep this one", width=100, height=22, corner_radius=0, fg_color="#1f2029", hover_color="#2c3043", font=(UI_FONT, 13), command=lambda f=f: choose(f)).grid(pady=6)
             state["cells"] = cells
             state["shown"] = [None] * n
             caption.configure(text=MODE_HELP[mode])
@@ -2807,7 +3262,7 @@ def compare_open():
             lab = tk.Label(view, image=full_photos[state["blink"]], bd=0, bg=PAD_COLOR, cursor="hand2")
             lab.grid()
             lab.bind("<ButtonRelease-1>", flip)
-            ctk.CTkButton(view, text="Keep this one", width=120, height=26, font=(UI_FONT, 14), command=lambda: choose(kept[state["blink"]])).grid(pady=(8, 0))
+            ctk.CTkButton(view, corner_radius=0, fg_color="#1f2029", hover_color="#2c3043", text="Keep this one", width=120, height=24, font=(UI_FONT, 14), command=lambda: choose(kept[state["blink"]])).grid(pady=(8, 0))
             state["label"] = lab
             blink_caption()
         elif mode == "Slider":
@@ -2825,27 +3280,82 @@ def compare_open():
                 photo, legend, pct = result
                 tk.Label(view, image=photo, bd=0, bg=PAD_COLOR).grid()
                 info = MODE_HELP[mode]
-                if pct is not None:
-                    info += " · nothing significant changed" if pct < 0.2 else f" · {pct:.1f}% of the picture changed"
+                if pct is not None and pct >= 0.2:
+                    info += f" · {pct:.1f}%"
                 if shapes_differ:
                     info += " · the photos have different shapes, so treat this with care"
                 caption.configure(text=info)
                 for k, (color, label) in enumerate(legend):
                     tk.Label(legend_frame, text="   ", bg=color).grid(row=0, column=2 * k, padx=(10, 4))
                     tk.Label(legend_frame, text=label, bg=PAD_COLOR, fg="#c8ccd8", font=(UI_FONT, 12)).grid(row=0, column=2 * k + 1)
-        center_on_main(win)
+        if not state.get("placed"):
+            state["placed"] = True
+            center_on_main(win)
 
     def set_mode(value):
         state["mode"] = value
         draw()
 
-    mode_bar = ctk.CTkSegmentedButton(modes, values=list(COMPARE_MODES), command=set_mode, font=(UI_FONT, 14))
+    mode_bar = ctk.CTkSegmentedButton(modes, values=list(COMPARE_MODES), command=set_mode, font=(UI_FONT, 14), border_width=0, fg_color=PAD_COLOR, unselected_color="#1f2029", corner_radius=0)
     mode_bar.set(state["mode"])
-    mode_bar.grid(row=0, column=0)
+    ctk.CTkLabel(modes, text="Q", font=(UI_FONT, 16), text_color="grey").grid(row=0, column=0, padx=(0, 8))
+    mode_bar.grid(row=0, column=1)
+    ctk.CTkLabel(modes, text="E", font=(UI_FONT, 16), text_color="grey").grid(row=0, column=2, padx=(8, 0))
+    def key_mode(name):
+        def handler(event=None):
+            mode_bar.set(name)
+            set_mode(name)
+            return "break"
+        return handler
+
+    def cycle_mode(delta):
+        def handler(event=None):
+            names = list(COMPARE_MODES)
+            name = names[(names.index(state["mode"]) + delta) % len(names)]
+            mode_bar.set(name)
+            set_mode(name)
+            return "break"
+        return handler
+
+    def key_step(delta):
+        def handler(event=None):
+            if state["mode"] == "Blink" and state["label"] is not None:
+                state["blink"] = (state["blink"] + delta) % n
+                state["label"].configure(image=full_photos[state["blink"]])
+                blink_caption()
+            elif state["mode"] == "Side by side":
+                state["pick"] = (state["pick"] + delta) % n
+                draw()
+            elif state["mode"] == "Slider":
+                state["pair"] += delta
+                draw()
+            return "break"
+        return handler
+
+    def key_keep_shown(event=None):
+        if state["mode"] == "Blink":
+            choose(kept[state["blink"]])
+        elif state["mode"] == "Side by side":
+            choose(kept[state["pick"]])
+        elif state["mode"] == "Slider":
+            choose(kept[state["pair"] % (n - 1)])
+        return "break"
+
+    def key_close(event=None):
+        compare_close()
+        return "break"
 
     win.bind("<space>", flip)
     win.bind("<Key-0>", side_reset)
-    win.bind("<Escape>", compare_close)
+    for seq in ("<Escape>", "<Return>", "<KP_Enter>", "<Tab>"):
+        win.bind(seq, key_close)
+    for number, name in enumerate(COMPARE_MODES, start=1):
+        win.bind(f"<Key-{number}>", key_mode(name))
+    win.bind("<Left>", key_step(-1))
+    win.bind("<Right>", key_step(1))
+    for letters, handler in (("qQ", cycle_mode(-1)), ("eE", cycle_mode(1)), ("aA", key_step(-1)), ("dD", key_step(1)), ("kKrR", key_keep_shown)):
+        for letter in letters:
+            win.bind(f"<{letter}>", handler)
     draw()
     full_begin()
     win.after(300, lambda: set_inspect_icon(win))
@@ -2862,16 +3372,1018 @@ def move_journaled(item, destination):
         return False
 
 def delete_rest():
-    global journal_name, pics_stamp, scan_order
     kept, rest = group_kept_files()
     if open_idx is None or open_idx == other_idx or not kept or not rest:
         return
+    if execute_button.cget("state") == "disabled":
+        messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
+        return
     if not messagebox.askyesno("Specorde", f"Keep {len(kept)}, move {len(rest)} others to '{rejected_name}'?\n\nYou can undo this with 'Restore folder' in Organize.\n\nContinue?"):
         return
+    reject_files(rest, kept)
+
+def pictures_open():
+    global currently_open
+    global pending_pics
+    global pics_folder
+    global cards
+    middle_reset()
+    middle.grid_columnconfigure(0, weight=1)
+    middle.grid_rowconfigure(8, weight=0)
+    middle.grid_rowconfigure(10, weight=1)
+    header.grid(column=0, row=0, sticky="ew", pady=(0,16))
+    culler_label.grid(sticky="nw", pady=18, padx=18)
+    folder_strip.grid(row=0, column=0, columnspan=3, sticky="nw")
+    if pics_view == "edit" and ed_view.file is not None:
+        ed_focus(True)
+        ed_back_button.grid(row=1, column=0, sticky="w", padx=(16, 8), pady=10)
+        ed_name_label.configure(text=trim(ed_view.file.name, 60))
+        ed_name_label.grid(row=1, column=1, sticky="w", pady=10)
+        ed_view.frame.grid(row=1, column=0, sticky="n")
+        currently_open = 3
+        return
+    culler_mode_switch.set("All photos" if pics_mode == "all" else "Groups")
+    culler_mode_switch.grid(row=0, column=1, sticky="w")
+    header_show()
+    if "target_folder" not in globals():
+        pending_pics = []
+        cards = []
+        pics_folder = None
+        grid_clear()
+        no_folder_label.grid(row=1, pady=20)
+    else:
+        if target_folder != pics_folder or folder_stamp() != pics_stamp:
+            grid_load_folder()
+        elif scan_active or copies_active:
+            culler_loading.grid(row=1, pady=20)
+        else:
+            overview_frame.grid(row=1, column=0, sticky="ew")
+            cutesy_bar.grid(row=10, column=0, sticky="sew")
+            empty_update()
+            schedule_refresh()
+    currently_open = 3
+    bottom_bar_update()
+
+def organize_open():
+    global actions_water
+    global actions_find
+    global actions_sort
+    global middle
+    global currently_open
+
+    if not currently_open == 0:
+        middle_reset()
+    
+    middle.grid_columnconfigure(2, weight=0)
+    middle.grid_rowconfigure(10, weight=1)
+    middle.grid_rowconfigure(8, weight=0)
+    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
+    organize_title.grid(sticky="nw", pady=18, padx=18)
+    folder_strip.grid(row=0, column=0, columnspan=3, sticky="nw")
+    actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
+    actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
+    actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
+    actions_rename.grid(sticky="nw", padx=32, pady=10, row=7)
+    execute_button.grid(row=9, column=0, padx=104,pady=24)
+    footer.grid(row=10, column=0, sticky="sw", padx=0, pady=(0,0))
+    file_disclaimer.grid(row=0, column=0, sticky="sw", pady=0, padx=12)
+    restore_button.grid(row=0, column=1, sticky="e", padx=(146, 60), pady=6)
+    dry_run_button.grid(row=0, column=1, sticky="e", padx=(200, 0), pady=6)
+    currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
+
+def settings_open(option=0):
+    global currently_open
+    middle_reset()
+    middle.grid_columnconfigure(0, weight=1)
+    middle.grid_rowconfigure(8, weight=1)
+    header.grid(column=0, row=0, sticky="ew", pady=(0,16))
+    settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
+    settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
+    settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
+    folder_strip.grid(row=0, column=0, columnspan=3, sticky="nw")
+    if option == 1:
+        water_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
+        water_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+    else:
+        find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
+        find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+        sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
+        sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
+        rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
+        rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
+    currently_open = 1
+
+def settings_change(option=0):
+    settings_open(option)
+
+def tutorial_open():
+    global middle
+    global currently_open
+    if not currently_open == 2:
+        middle_reset()
+    middle.grid_columnconfigure(0, weight=1)
+    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
+    tutorial_label.grid(sticky="nw", pady=18, padx=18)
+    folder_strip.grid(row=0, column=0, columnspan=3, sticky="nw")
+    tutorial_frame.grid(row=1, column=0, sticky="nw", padx=(18, 6))
+    currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
+
+SOFT_RATIO = 0.45
+PICK_MARGIN = 1.25
+SOFT_MAX_SHARE = 0.5
+suggest_busy = False
+BEST_COLOR = "#c79a1b"
+SOFT_COLOR = "#c8641f"
+DONE_COLOR = "#2e8b57"
+IDLE_COLOR = "#173348"
+
+def sharp_verdict(scores):
+    valid = {f: s for f, s in scores.items() if s is not None}
+    if len(valid) < 2:
+        return {}, ""
+    ranked = sorted(valid.values(), reverse=True)
+    best = ranked[0]
+    if best <= 0:
+        return {}, ""
+    best_file = max(valid, key=valid.get)
+    logging.debug("Sharpness (relative to best): %s", ", ".join(f"{f.name}={s / best:.2f}" for f, s in valid.items()))
+    clear_win = ranked[1] <= 0 or best / ranked[1] >= PICK_MARGIN
+    soft = {f for f, s in valid.items() if f != best_file and s < best * SOFT_RATIO}
+    if len(soft) > len(valid) * SOFT_MAX_SHARE:
+        soft = set()
+    tags = {f: "soft" for f in soft}
+    if clear_win:
+        tags[best_file] = "best"
+    if not tags:
+        return {}, "no clear winner, all about equally sharp"
+    parts = [f"★ Sharpest: {trim(best_file.name, 18)}" if clear_win else "top shots are equally sharp"]
+    if soft:
+        parts.append(f"{len(soft)} soft")
+    return tags, "  ·  ".join(parts)
+
+def best_file_now():
+    return next((f for f, tag in suggest_tags.items() if tag == "best"), None)
+
+def suggest_button_update():
+    best = best_file_now()
+    if open_idx is None or open_idx == other_idx:
+        btn_set(culler_suggest_button, text="No clear pick", state="disabled", fg_color=IDLE_COLOR)
+    elif suggest_busy:
+        btn_set(culler_suggest_button, text="Checking...", state="disabled", fg_color=IDLE_COLOR)
+    elif best is None:
+        btn_set(culler_suggest_button, text="No clear pick", state="disabled", fg_color=IDLE_COLOR)
+    elif str(best) in keep_set:
+        btn_set(culler_suggest_button, text="★ Kept", state="disabled", fg_color=DONE_COLOR)
+    else:
+        btn_set(culler_suggest_button, text="★ Keep sharpest", state="normal", fg_color=BEST_COLOR)
+
+def banner_draw():
+    pic_canvas.delete("banner")
+    if at_groups():
+        return
+    if open_idx is None:
+        text = f"All photos · {len(cards)} · drag to select · right-click for options"
+    else:
+        text = group_title(open_idx) + ("  ·  finished ✓" if group_is_done(open_idx) else "") + "  ·  drag to select  ·  right-click for options"
+    s = ui_scale()
+    pic_canvas.create_text(grid_left * s, grid_top * s / 2, text=text, anchor="w", fill="#9aa0b0", font=(UI_FONT, -round(15 * s)), tags="banner")
+
+def suggest_progress(token, done, total):
+    return
+
+def key_suggest():
+    if open_idx is None:
+        return
+    best = best_file_now()
+    i = card_index_of(best) if best is not None else None
+    if i is None:
+        return
+    if str(best) not in keep_set:
+        keep_flip(i)
+    sel_set(i)
+
+def suggest_start(idx):
+    global suggest_token, suggest_tags, suggest_busy
+    suggest_token += 1
+    suggest_tags = {}
+    suggest_busy = False
+    if idx == other_idx or len(groups[idx]) < 2:
+        suggest_button_update()
+        banner_draw()
+        return
+    token = suggest_token
+    files = list(groups[idx])
+    total = len(files)
+    suggest_busy = True
+    suggest_button_update()
+    banner_draw()
+
+    def work():
+        scores = {}
+        for number, f in enumerate(files, start=1):
+            if token != suggest_token:
+                return
+            scores[f] = sharp_get(f)
+            q.put(("suggest_progress", (token, number, total)))
+        tags, note = sharp_verdict(scores)
+        q.put(("suggest", (token, tags, note)))
+
+    threading.Thread(target=work, daemon=True).start()
+
+def suggest_apply(token, tags, note):
+    global suggest_tags, suggest_busy
+    if token != suggest_token or open_idx is None:
+        return
+    suggest_tags = tags
+    suggest_busy = False
+    suggest_button_update()
+    for i in range(len(cards)):
+        if (i, 0) in pic_cells:
+            badge_refresh(i)
+    banner_draw()
+    sel_draw()
+
+def group_open(idx, switching=False):
+    global cards
+    global pending_pics
+    global open_idx
+    global saved_top
+    global sel_idx
+    marq_clear()
+    if switching:
+        click_cancel()
+        inspect_close_all()
+        compare_close()
+        peek_close()
+    else:
+        saved_top = pic_canvas.yview()[0]
+    open_idx = idx
+    cards = [[f] for f in groups[idx]]
+    pending_pics = [c[0] for c in cards]
+    sel_idx = 0 if sel_visible else None
+    culler_info_label.configure(text=group_title(idx))
+    header_show()
+    groups_show()
+    inspect_preload(idx)
+    suggest_start(idx)
+
+def group_close(event=None):
+    global cards
+    global pending_pics
+    global open_idx
+    global sel_idx
+    global suggest_token
+    global suggest_tags
+    marq_clear()
+    if open_idx is None:
+        return
+    closed = open_idx
+    click_cancel()
+    inspect_close_all()
+    compare_close()
+    peek_close()
+    suggest_token += 1
+    suggest_tags = {}
+    open_idx = None
+    cards = groups
+    pending_pics = [c[0] for c in cards]
+    sel_idx = closed if sel_visible else None
+    header_show()
+    grid_clear()
+    grid_update_region(grid_geometry())
+    pic_canvas.yview_moveto(saved_top)
+    if sel_visible:
+        sel_scroll_into_view()
+    schedule_refresh()
+
+sel_idx = None
+sel_visible = False
+keys_window = None
+
+KEY_SECTIONS = [
+    ("Moving", [
+        ("Move the frame", "Arrows or W A S D"),
+        ("Open group or photo", "Space, Enter or Tab"),
+    ]),
+    ("Culling", [
+        ("Keep a photo", "R or K"),
+        ("Keep the sharpest", "B"),
+        ("Mark group finished", "F"),
+        ("Finished + next group", "N"),
+        ("Edit the selected photo", "G"),
+        ("Select with a rectangle", "Drag (Ctrl adds)"),
+        ("Select everything", "Ctrl+A"),
+        ("Clear selection", "Esc"),
+        ("Previous / next group", "[   ]"),
+        ("Compare kept", "C"),
+        ("Clear kept", "U"),
+        ("Wrap up", "E"),
+    ]),
+    ("Hold to peek", [
+        ("Peek at a photo", "Hold Space, Enter or Tab"),
+    ]),
+]
+
+def main_focus_later():
+    def go():
+        try:
+            if not inspect_windows and compare_window is None:
+                canvas.focus_force()
+        except Exception:
+            pass
+    try:
+        canvas.after(40, go)
+    except Exception:
+        pass
+
+def sel_hide():
+    global sel_visible
+    sel_visible = False
+    pic_canvas.delete("sel")
+
+def sel_draw():
+    global sel_idx
+    pic_canvas.delete("sel")
+    if not sel_visible or sel_idx is None or not cards:
+        return
+    sel_idx = min(sel_idx, len(cards) - 1)
+    rects = stack_rects(sel_idx, grid_geometry())
+    left = rects[0][0]
+    top = rects[-1][1]
+    right = left + rects[0][2]
+    bottom = rects[0][1] + rects[0][3]
+    pad = 3 * ui_scale()
+    pic_canvas.create_rectangle(left - pad, top - pad, right + pad, bottom + pad, outline="#ffd24a", width=3, tags="sel")
+
+def sel_scroll_into_view():
+    if sel_idx is None or not cards:
+        return
+    geo = grid_geometry()
+    row = sel_idx // geo["per_row"]
+    top = geo["slot0"] + row * geo["pitch"]
+    bottom = top + geo["pitch"]
+    view_top = pic_canvas.canvasy(0)
+    view_h = grid_view_h(geo)
+    if top < view_top:
+        new_top = 0 if row == 0 else top
+    elif bottom > view_top + view_h:
+        new_top = bottom - view_h
+    else:
+        return
+    new_top = max(0, min(new_top, pic_total_h - view_h))
+    if pic_total_h > view_h:
+        pic_canvas.yview_moveto(new_top / pic_total_h)
+    schedule_refresh()
+
+def sel_set(idx):
+    global sel_idx, sel_visible
+    if not cards:
+        return
+    sel_visible = True
+    sel_idx = max(0, min(len(cards) - 1, idx))
+    hover_clear()
+    sel_scroll_into_view()
+    sel_draw()
+
+def key_ok():
+    if currently_open != 3 or "target_folder" not in globals() or scan_active or copies_active:
+        return False
+    try:
+        focus = canvas.focus_get()
+    except Exception:
+        focus = None
+    return not isinstance(focus, (tk.Entry, tk.Text))
+
+def next_undone(start):
+    n = len(groups)
+    for step in range(1, n + 1):
+        i = (start + step) % n
+        if i != start and i != other_idx and not group_is_done(i):
+            return i
+    return None
+
+def key_default_index():
+    if at_groups():
+        i = next_undone(-1)
+        return i if i is not None else 0
+    best = next((f for f, tag in suggest_tags.items() if tag == "best"), None)
+    i = card_index_of(best) if best is not None else None
+    return i if i is not None else 0
+
+def key_move(delta):
+    if not cards:
+        return
+    if not sel_visible or sel_idx is None:
+        sel_set(sel_idx if sel_idx is not None else key_default_index())
+    else:
+        sel_set(sel_idx + delta)
+
+def key_edge(last):
+    if cards:
+        sel_set(len(cards) - 1 if last else 0)
+
+def key_page(direction):
+    if not cards:
+        return
+    if not sel_visible or sel_idx is None:
+        sel_set(key_default_index())
+        return
+    geo = grid_geometry()
+    rows = max(1, int(grid_view_h(geo) // geo["pitch"]))
+    sel_set(sel_idx + direction * rows * geo["per_row"])
+
+def key_open():
+    if not cards:
+        return
+    if not sel_visible or sel_idx is None:
+        sel_set(key_default_index())
+    if sel_idx is None:
+        return
+    if at_groups():
+        group_open(sel_idx)
+    else:
+        inspect_show(sel_idx)
+
+def key_back():
+    if marq_sel:
+        marq_clear()
+    elif open_idx is not None:
+        group_close()
+    else:
+        sel_hide()
+
+def key_keep():
+    if marq_sel:
+        marq_keep(not all(str(f) in keep_set for f in marq_sel))
+        return
+    if at_groups() or not cards:
+        return
+    if not sel_visible or sel_idx is None:
+        sel_set(key_default_index())
+        return
+    keep_flip(sel_idx)
+
+def key_unkeep():
+    if open_idx is not None:
+        clear_kept()
+
+def key_done():
+    if pics_mode == "all": return
+    idx = open_idx if open_idx is not None else sel_idx
+    if idx is None or idx == other_idx or idx >= len(groups):
+        return
+    done_set_group(idx, not group_is_done(idx))
+    if open_idx is None:
+        if (idx, 0) in pic_cells:
+            badge_refresh(idx)
+    else:
+        banner_draw()
+
+def key_next():
+    if pics_mode == "all": return
+    if not groups:
+        return
+    if open_idx is not None:
+        current = open_idx
+        kept, _ = group_kept_files()
+        if kept and current != other_idx:
+            done_set_group(current, True)
+        target = next_undone(current)
+        if target is None:
+            group_close()
+            return
+        group_open(target, switching=True)
+    else:
+        target = next_undone(sel_idx if sel_idx is not None else -1)
+        if target is not None:
+            sel_set(target)
+
+def key_compare():
+    if open_idx is None:
+        return
+    kept, _ = group_kept_files()
+    if 2 <= len(kept) <= 4:
+        compare_open()
+
+def key_group_step(delta):
+    if open_idx is None:
+        return
+    i = open_idx + delta
+    while 0 <= i < len(groups) and i == other_idx:
+        i += delta
+    if 0 <= i < len(groups):
+        group_open(i, switching=True)
+
+
+def key_finish():
+    if open_idx is None:
+        finish_open()
+
+def keys_close(event=None):
+    global keys_window
+    if keys_window is not None:
+        try:
+            keys_window.destroy()
+        except Exception:
+            pass
+        keys_window = None
+    main_focus_later()
+
+def keys_open(event=None):
+    global keys_window
+    if keys_window is not None:
+        keys_close()
+        return
+    win = ctk.CTkToplevel(canvas)
+    win.withdraw()
+    win.title("Keyboard shortcuts")
+    win.configure(fg_color="#1f2029")
+    win.resizable(False, False)
+    win.transient(canvas)
+    win.protocol("WM_DELETE_WINDOW", keys_close)
+    keys_window = win
+    ctk.CTkLabel(win, text="Keyboard shortcuts", font=(UI_FONT, 26)).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(16, 4))
+    row = 1
+    for title, lines in KEY_SECTIONS:
+        ctk.CTkLabel(win, text=title, font=(UI_FONT, 17), text_color="grey").grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=(10, 2))
+        row += 1
+        for action, keys in lines:
+            ctk.CTkLabel(win, text=action, font=(UI_FONT, 15), anchor="w").grid(row=row, column=0, sticky="w", padx=(20, 16), pady=2)
+            ctk.CTkLabel(win, text=f"  {keys}  ", font=(UI_FONT, 15), fg_color="#2c3043", corner_radius=6).grid(row=row, column=1, sticky="e", padx=(0, 20), pady=2)
+            row += 1
+    ctk.CTkLabel(win, text="Press any key to close", font=(UI_FONT, 13), text_color="grey").grid(row=row, column=0, columnspan=2, pady=(12, 16))
+    win.bind("<Key>", keys_close)
+    center_on_main(win)
+    win.after(300, lambda: set_inspect_icon(win))
+    win.after(60, lambda: reveal(win))
+
+hold_keys = {"tab", "return", "kp_enter", "space", "k", "r"}
+key_held = {}
+
+def key_tap(key):
+    if key in ("k", "r"):
+        key_keep()
+    else:
+        key_open()
+
+def key_peek_start(key):
+    global peek_window
+    key_held[key] = "peek"
+    if sel_idx is None or sel_idx >= len(cards):
+        return
+    img = inspect_load(cards[sel_idx][0])
+    if img is None:
+        return
+    peek_close()
+    hover_clear()
+    photo = ImageTk.PhotoImage(img)
+    win = tk.Toplevel(canvas)
+    win.overrideredirect(True)
+    win.configure(bg=card_edge)
+    win.withdraw()
+    label = tk.Label(win, image=photo, bd=0, bg="#101117")
+    label.image = photo
+    label.pack(padx=3, pady=3)
+    place_at_mouse(win, canvas.winfo_x() + canvas.winfo_width() // 2, canvas.winfo_y() + canvas.winfo_height() // 2)
+    win.deiconify()
+    win.attributes("-topmost", True)
+    peek_window = win
+
+def key_release(event):
+    key = event.keysym.lower()
+    job = key_held.pop(key, None)
+    if job is None:
+        return
+    if job == "peek":
+        peek_close()
+        return "break"
+    if job == "done":
+        return
+    canvas.after_cancel(job)
+    key_tap(key)
+    return "break"
+
+def key_reset(event=None):
+    if event is not None and event.widget is not canvas:
+        return
+    for job in key_held.values():
+        if job not in ("peek", "done"):
+            try:
+                canvas.after_cancel(job)
+            except Exception:
+                pass
+    key_held.clear()
+    peek_close()
+
+def focus_in_text():
+    try:
+        focus = canvas.focus_get()
+    except Exception:
+        return False
+    return isinstance(focus, (tk.Entry, tk.Text))
+
+def menu_cycle(menu, command=None):
+    values = list(menu.cget("values"))
+    if not values:
+        return
+    current = menu.get()
+    position = values.index(current) if current in values else -1
+    new = values[(position + 1) % len(values)]
+    menu.set(new)
+    if command:
+        command(new)
+
+def ready():
+    return execute_button.cget("state") != "disabled"
+
+def page_key(event):
+    key = event.keysym.lower()
+    if currently_open == 0:
+        if key == "1":
+            actions_find.toggle()
+        elif key == "2":
+            actions_sort.toggle()
+        elif key == "3":
+            actions_rename.toggle()
+        elif key in ("return", "kp_enter") and ready():
+            run_execute()
+        elif key == "p" and ready():
+            dry_run_toggle()
+        elif key == "r" and ready():
+            restore_click()
+        elif key == "o" and ready():
+            pick_folder()
+        else:
+            return
+    elif water_settings.winfo_ismapped():
+        if key == "1":
+            settings_change(0)
+        elif key == "p":
+            menu_cycle(settings_watermark_corner)
+        elif key in ("plus", "equal", "kp_add"):
+            plus()
+        elif key in ("minus", "kp_subtract"):
+            minus()
+        else:
+            return
+    else:
+        if key == "2":
+            settings_change(1)
+        elif key == "d":
+            menu_cycle(settings_duplicate_delete)
+        elif key == "s":
+            menu_cycle(settings_sort_sortby)
+        elif key == "t":
+            menu_cycle(settings_sort_structure)
+        elif key == "n":
+            menu_cycle(settings_rename_pattern, rename_pattern_changed)
+        elif key == "b" and settings_rename_renameby.winfo_ismapped():
+            menu_cycle(settings_rename_renameby)
+        else:
+            return
+    return "break"
+
+def key_press(event):
+    if event.state & 0x20004:
+        return
+    if currently_open in (0, 1):
+        if focus_in_text():
+            return
+        return page_key(event)
+    if currently_open == 3 and pics_view == "edit":
+        return editor_key(event)
+    if not key_ok():
+        return
+    key = event.keysym.lower()
+    shift = bool(event.state & 0x1)
+    per_row = grid_geometry()["per_row"]
+    if key in hold_keys and not (key == "tab" and shift):
+        if key in key_held:
+            return "break"
+        if not sel_visible or sel_idx is None:
+            key_held[key] = "done"
+            key_tap(key)
+        else:
+            key_held[key] = canvas.after(hold_ms, lambda k=key: key_peek_start(k))
+        return "break"
+    if key in ("left", "a"):
+        key_move(-1)
+    elif key in ("right", "d"):
+        key_move(1)
+    elif key in ("up", "w"):
+        key_move(-per_row)
+    elif key in ("down", "s"):
+        key_move(per_row)
+    elif key == "home":
+        key_edge(False)
+    elif key == "end":
+        key_edge(True)
+    elif key == "prior":
+        key_page(-1)
+    elif key == "next":
+        key_page(1)
+    elif key == "iso_left_tab" or (key == "tab" and shift):
+        key_back()
+    elif key in ("return", "kp_enter", "tab", "space"):
+        key_open()
+    elif key in ("escape", "backspace"):
+        key_back()
+    elif key in ("k", "r"):    
+        key_keep()
+    elif key == "b":
+        key_suggest()
+    elif key == "f":
+        key_done()
+    elif key == "n":
+        key_next()
+    elif key == "bracketleft":
+        key_group_step(-1)
+    elif key == "bracketright":
+        key_group_step(1)
+    elif key == "c":
+        key_compare()
+    elif key == "u":
+        key_unkeep()
+    elif key == "e":
+        key_finish()
+    elif key == "g":
+        key_edit()
+    elif key in ("f1", "question"):
+        keys_open()
+    else:
+        return
+    return "break"
+
+inspect_state = {}
+
+def inspect_caption(file):
+    return file.name
+
+def inspect_close(win):
+    if win in inspect_windows:
+        inspect_windows.remove(win)
+    for key in [k for k, v in inspect_by_file.items() if v is win]:
+        del inspect_by_file[key]
+        inspect_buttons.pop(key, None)
+    inspect_state.pop(win, None)
+    try:
+        win.destroy()
+    except Exception:
+        pass
+    main_focus_later()
+
+def inspect_fill(win, file, img):
+    st = inspect_state[win]
+    old = st["file"]
+    if old is not None:
+        inspect_by_file.pop(old, None)
+        inspect_buttons.pop(old, None)
+    photo = ImageTk.PhotoImage(img)
+    st["label"].configure(image=photo)
+    st["label"].image = photo
+    st["caption"].configure(text=inspect_caption(file))
+    st["button"].configure(text=keep_text(file))
+    st["file"] = file
+    inspect_by_file[file] = win
+    inspect_buttons[file] = st["button"]
+    try:
+        win.title(file.name)
+    except Exception:
+        pass
+
+def inspect_recenter(win, cx, cy):
+    try:
+        win.update_idletasks()
+        w = win.winfo_reqwidth()
+        h = win.winfo_reqheight()
+        left, top, right, bottom = monitor_area(cx, cy)
+        px = min(max(cx - w // 2, left), max(right - w, left))
+        py = min(max(cy - h // 2, top), max(bottom - h, top))
+        tk.Wm.geometry(win, f"+{px}+{py}")
+    except Exception:
+        logging.exception("Could not recentre the photo window.")
+
+def inspect_keep(win):
+    st = inspect_state.get(win)
+    if st is None or st["file"] is None:
+        return
+    lock_toggle(st["file"])
+    keep_refresh(st["file"])
+
+def inspect_prefetch(center):
+    box = inspect_box()
+    files = [cards[i][0] for i in (center + 1, center - 1, center + 2) if 0 <= i < len(cards)]
+
+    def work():
+        for f in files:
+            inspect_load(f, box)
+
+    threading.Thread(target=work, daemon=True).start()
+
+def inspect_step(win, delta):
+    st = inspect_state.get(win)
+    if st is None or at_groups():
+        return
+    current = card_index_of(st["file"])
+    if current is None:
+        return
+    new = current + delta
+    if not 0 <= new < len(cards):
+        return
+    target = cards[new][0]
+    other = inspect_by_file.get(target)
+    if other is not None and other is not win:
+        try:
+            if other.winfo_exists():
+                other.lift()
+                other.focus_force()
+                return
+        except Exception:
+            pass
+    img = inspect_load(target)
+    if img is None:
+        return
+    inspect_fill(win, target, img)
+    inspect_recenter(win, st["cx"], st["cy"])
+    sel_set(new)
+    inspect_prefetch(new)
+
+def inspect_show(idx, x=None, y=None):
+    if idx >= len(cards):
+        return
+    file = cards[idx][0]
+    existing = inspect_by_file.get(file)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            pass
+    img = inspect_load(file)
+    if img is None:
+        return
+    hover_clear()
+
+    win = ctk.CTkToplevel(canvas)
+    win.withdraw()
+    win.configure(fg_color="#101117")
+    win.resizable(False, False)
+    win.transient(canvas)
+    win.protocol("WM_DELETE_WINDOW", lambda: inspect_close(win))
+
+    frame = tk.Frame(win, bg="#101117", highlightbackground=card_edge, highlightthickness=2, bd=0)
+    frame.grid(row=0, column=0, padx=14, pady=(14, 6))
+    label = tk.Label(frame, bd=0, bg="#101117", cursor="hand2")
+    label.grid(padx=5, pady=5)
+    label.bind("<ButtonRelease-1>", lambda e: inspect_close(win))
+    caption = tk.Label(win, text="", bg="#101117", fg="#c8ccd8", font=(UI_FONT, 12))
+    caption.grid(row=1, column=0)
+    keep_button = ctk.CTkButton(win, text="Keep", command=lambda: inspect_keep(win), font=(UI_FONT, 16), width=120, height=30)
+    keep_button.grid(row=2, column=0, pady=(8, 6))
+    ctk.CTkButton(win, text="Edit", command=lambda: edit_from_inspect(win), font=(UI_FONT, 16), width=120, height=30).grid(row=3, column=0, pady=(0, 12))
+    inspect_state[win] = {"file": None, "label": label, "caption": caption, "button": keep_button, "cx": 0, "cy": 0}
+    inspect_fill(win, file, img)
+
+    held = set()
+
+    def on_key(event):
+        key = event.keysym.lower()
+        if key in ("left", "up", "a", "w", "right", "down", "d", "s"):
+            inspect_step(win, -1 if key in ("left", "up", "a", "w") else 1)
+            return "break"
+        if key in held:
+            return "break"
+        if key in ("return", "kp_enter", "escape", "tab", "space"):
+            inspect_close(win)
+        elif key in ("k", "r"):
+            held.add(key)
+            inspect_keep(win)
+        elif key == "g":
+            edit_from_inspect(win)
+        return "break"
+
+    def on_release(event):
+        held.discard(event.keysym.lower())
+
+    win.bind("<KeyPress>", on_key)
+    win.bind("<KeyRelease>", on_release)
+
+    offset = 28 * len(inspect_windows)
+    inspect_windows.append(win)
+    if x is None:
+        center_on_main(win, offset)
+        anchor_x = canvas.winfo_x() + canvas.winfo_width() // 2 + offset
+        anchor_y = canvas.winfo_y() + canvas.winfo_height() // 2 + offset
+    else:
+        place_at_mouse(win, x, y)
+        anchor_x, anchor_y = x, y
+    inspect_state[win]["cx"] = anchor_x
+    inspect_state[win]["cy"] = anchor_y
+    win.after(300, lambda: set_inspect_icon(win))
+    win.after(60, lambda: reveal(win))
+    inspect_prefetch(idx)
+
+kept_name = "kept_specorde"
+finish_window = None
+
+def finish_plans():
+    plans = []
+    skipped = 0
+    for i, g in enumerate(groups):
+        if i == other_idx or not group_is_done(i):
+            continue
+        kept = [f for f in g if str(f) in keep_set]
+        rest = [f for f in g if str(f) not in keep_set]
+        if kept and rest:
+            plans.append((kept, rest))
+        elif not kept:
+            skipped += 1
+    return plans, skipped
+
+def kept_now():
+    folder = str(target_folder)
+    return [Path(k) for k in sorted(keep_set) if os.path.dirname(k) == folder and os.path.isfile(k)]
+
+def finish_close(event=None):
+    global finish_window
+    if finish_window is not None:
+        try:
+            finish_window.destroy()
+        except Exception:
+            pass
+        finish_window = None
+    main_focus_later()
+
+def finish_open(event=None):
+    global finish_window
+    if open_idx is not None or scan_active or copies_active or "target_folder" not in globals():
+        return
+    if finish_window is not None:
+        finish_close()
+        return
+    plans, skipped = finish_plans()
+    n_groups = len(plans)
+    n_rest = sum(len(r) for _, r in plans)
+    kept = kept_now()
+    folder = target_folder / kept_name
+
+    win = ctk.CTkToplevel(canvas)
+    win.withdraw()
+    win.title("Wrap up culling")
+    win.configure(fg_color="#1f2029")
+    win.resizable(False, False)
+    win.transient(canvas)
+    win.protocol("WM_DELETE_WINDOW", finish_close)
+    finish_window = win
+
+    def do_reject():
+        finish_close()
+        apply_done(plans)
+
+    def do_collect():
+        finish_close()
+        collect_kept(kept)
+
+    def do_open():
+        try:
+            os.startfile(str(folder))
+        except Exception:
+            logging.exception("Could not open the kept folder.")
+
+    ctk.CTkLabel(win, text="Wrap up culling", font=(UI_FONT, 26)).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(16, 0))
+    ctk.CTkLabel(win, text="Only groups you marked finished (F or N) are touched.", font=(UI_FONT, 13), text_color="grey").grid(row=1, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 10))
+
+    reject_text = f"{n_rest} not-kept photo{'' if n_rest == 1 else 's'} in {n_groups} finished group{'' if n_groups == 1 else 's'}"
+    ctk.CTkLabel(win, text=reject_text, font=(UI_FONT, 16), anchor="w").grid(row=2, column=0, sticky="w", padx=(20, 16), pady=6)
+    ctk.CTkButton(win, text=f"Move to {rejected_name}", command=do_reject, font=(UI_FONT, 14), width=210, height=28, state="normal" if plans else "disabled", fg_color="#8b2e2e" if plans else "#173348").grid(row=2, column=1, padx=(0, 20), pady=6)
+
+    collect_text = f"{len(kept)} kept photo{'' if len(kept) == 1 else 's'}"
+    ctk.CTkLabel(win, text=collect_text, font=(UI_FONT, 16), anchor="w").grid(row=3, column=0, sticky="w", padx=(20, 16), pady=6)
+    ctk.CTkButton(win, text=f"Copy to {kept_name}", command=do_collect, font=(UI_FONT, 14), width=210, height=28, state="normal" if kept else "disabled", fg_color="#1f6aa5" if kept else "#173348").grid(row=3, column=1, padx=(0, 20), pady=6)
+
+    row = 4
+    if skipped:
+        ctk.CTkLabel(win, text=f"{skipped} finished group{'' if skipped == 1 else 's'} with nothing kept {'is' if skipped == 1 else 'are'} left alone.", font=(UI_FONT, 13), text_color="grey").grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=(2, 0))
+        row += 1
+    if folder.is_dir():
+        ctk.CTkButton(win, text=f"Open {kept_name}", command=do_open, font=(UI_FONT, 13), width=150, height=24).grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=(10, 0))
+        row += 1
+    ctk.CTkLabel(win, text="Moving can be undone with 'Restore folder'. Copies are not removed by it.", font=(UI_FONT, 12), text_color="grey").grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=(10, 4))
+    ctk.CTkButton(win, text="Close", command=finish_close, font=(UI_FONT, 14), width=90, height=24).grid(row=row + 1, column=0, columnspan=2, sticky="e", padx=20, pady=(4, 16))
+    win.bind("<Escape>", finish_close)
+    center_on_main(win)
+    win.after(300, lambda: set_inspect_icon(win))
+    win.after(60, lambda: reveal(win))
+
+def reject_files(rest, kept):
+    global journal_name, pics_stamp, scan_order, sel_idx
+    global suggest_token, suggest_tags
     rejected = target_folder / rejected_name
-    journal_path.mkdir(parents=True, exist_ok=True)
     journal_name = journal_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.jsonl"
     try:
+        journal_path.mkdir(parents=True, exist_ok=True)
         with open(journal_name, "x", encoding="utf-8") as f:
             f.write(json.dumps({"folder": str(target_folder)}) + "\n")
         rejected.mkdir(exist_ok=True)
@@ -2902,6 +4414,11 @@ def delete_rest():
     for f in moved_files:
         photo_info.pop(f, None)
     pics_stamp = folder_stamp()
+    done_set.update(str(f) for f in kept)
+    done_save()
+    suggest_token += 1
+    suggest_tags = {}
+    sel_idx = None
     inspect_close_all()
     compare_close()
     groups_build()
@@ -2914,128 +4431,1370 @@ def delete_rest():
     q.put(("summary_add", text))
     q.put(("summary_hide_later", None))
 
-def pictures_open():
-    global currently_open
-    global pending_pics
-    global pics_folder
-    global cards
-    middle_reset()
-    middle.grid_columnconfigure(0, weight=1)
-    middle.grid_rowconfigure(8, weight=1)
-    header.grid(column=0, row=0, sticky="ew", pady=(0,16))
-    culler_label.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(row=0, column=1, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=1, columnspan=2, sticky="w", pady=(24,20), padx=(312,8))
-    culler_size_label.grid(sticky="e", pady=8, padx=(0,95), column=2, row=1)
-    culler_size_changer.grid(sticky="se", pady=10, padx=(8,16), column=2, row=1)
-    header_show()
-    if "target_folder" not in globals():
-        pending_pics = []
-        cards = []
-        pics_folder = None
-        grid_clear()
-        no_folder_label.grid(row=1, pady=20)
-    else:
-        if target_folder != pics_folder or folder_stamp() != pics_stamp:
-            grid_load_folder()
-        elif scan_active or copies_active:
-            culler_loading.grid(row=1, pady=20)
-        else:
-            overview_frame.grid(row=1, column=0, sticky="ew")
-            cutesy_bar.grid(row=2, column=0, sticky="ew")
-            empty_update()
-            schedule_refresh()
-    currently_open = 3
-
-def pictures_size():
-    global size
-    old = grid_geometry()
-    view_h = grid_view_h(old)
-    mid = pic_canvas.canvasy(0) + view_h / 2
-    t = max((mid - old["slot0"]) / old["pitch"], 0)
-    anchor_row = int(t)
-    anchor_frac = t - anchor_row
-    anchor_index = anchor_row * old["per_row"]
-
-    size = (size + 1) % 3
-    culler_size_changer.configure(text=("Small", "Medium", "Large")[size])
-
-    if not pending_pics:
+def apply_done(plans):
+    if not plans:
         return
-    new = grid_geometry()
-    total = grid_update_region(new)
-    new_mid = new["slot0"] + (anchor_index // new["per_row"] + anchor_frac) * new["pitch"]
-    new_top = max(0, min(new_mid - view_h / 2, total - view_h))
-    grid_clear()
-    pic_canvas.yview_moveto(new_top / total)
-    grid_refresh()
+    if execute_button.cget("state") == "disabled":
+        messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
+        return
+    rest = [f for _, r in plans for f in r]
+    kept = [f for k, _ in plans for f in k]
+    n = len(plans)
+    if not messagebox.askyesno("Specorde", f"Keep {len(kept)} and move {len(rest)} other photos from {n} finished group{'' if n == 1 else 's'} to '{rejected_name}'?\n\nOne 'Restore folder' in Organize puts all of them back.\n\nContinue?"):
+        return
+    reject_files(rest, kept)
 
-def organize_open():
-    global actions_water
-    global actions_find
-    global actions_sort
-    global middle
-    global currently_open
+def collect_work(files, folder):
+    q.put(("lock", None))
+    q.put(("summary_clear", None))
+    q.put(("bar_show", None))
+    q.put(("bar_text_show", None))
+    copied = 0
+    skipped = 0
+    failed = 0
+    try:
+        folder.mkdir(exist_ok=True)
+        sizes_list = []
+        for f in files:
+            try:
+                sizes_list.append(f.stat().st_size)
+            except OSError:
+                sizes_list.append(0)
+        total = sum(sizes_list) or 1
+        done = 0
+        bar_start()
+        for f, file_size in zip(files, sizes_list):
+            done += file_size
+            progress("Collecting kept...", done, total)
+            try:
+                destination = folder / f.name
+                if destination.exists() and destination.stat().st_size == file_size:
+                    skipped += 1
+                    continue
+                counter = 1
+                while destination.exists():
+                    destination = folder / f"{f.stem}_{counter}{f.suffix}"
+                    counter += 1
+                shutil.copy2(f, destination)
+                copied += 1
+            except OSError:
+                logging.exception("Could not copy %s.", f.name)
+                failed += 1
+    except Exception:
+        logging.exception("Collecting kept photos failed.")
+        failed += 1
+    finally:
+        logging.info("Collected kept photos: %d copied, %d already there, %d failed.", copied, skipped, failed)
+        text = f"✓ {copied} photo{'' if copied == 1 else 's'} copied to {kept_name}."
+        if skipped:
+            text += f" {skipped} already there."
+        if failed:
+            text = f"✗ {copied} copied, {failed} failed."
+        q.put(("bar_set", 1))
+        q.put(("bar_text", "100%"))
+        q.put(("summary_add", text))
+        q.put(("summary_hide_later", None))
+        q.put(("status", "Kept photos collected!" if not failed else "Collected with errors. See log."))
+        q.put(("status_reset", None))
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+        q.put(("unlock", None))
 
-    if not currently_open == 0:
-        middle_reset()
-    
-    middle.grid_columnconfigure(2, weight=0)
-    middle.grid_rowconfigure(10, weight=1)
-    middle.grid_rowconfigure(8, weight=0)
-    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
-    organize_title.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
-    actions_title.grid(sticky="nw", padx=26, pady=(25,10), row=4)
-    actions_find.grid(sticky="nw", padx=32, pady=(5,10), row=5)
-    actions_sort.grid(sticky="nw", padx=32, pady=10, row=6)
-    actions_rename.grid(sticky="nw", padx=32, pady=10, row=7)
-    execute_button.grid(row=9, column=0, padx=104,pady=24)
-    footer.grid(row=10, column=0, sticky="sw", padx=0, pady=(0,0))
-    file_disclaimer.grid(row=0, column=0, sticky="sw", pady=0, padx=12)
-    restore_button.grid(row=0, column=1, sticky="e", padx=(182, 60), pady=6)
-    dry_run_button.grid(row=0, column=1, sticky="e", padx=(226, 0), pady=6)
-    currently_open = 0 #(0 for organize, 1 for settings, 2 for tutorial)
+def collect_kept(files):
+    if not files:
+        return
+    if execute_button.cget("state") == "disabled":
+        messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
+        return
+    n = len(files)
+    if not messagebox.askyesno("Specorde", f"Copy {n} kept photo{'' if n == 1 else 's'} to '{kept_name}'?\n\nYour originals stay where they are. 'Restore folder' does not remove these copies.\n\nContinue?"):
+        return
+    lock_ui()
+    folder = target_folder / kept_name
+    start_execute(lambda: collect_work(files, folder))
 
-def settings_open(option=0):
-    global currently_open
-    middle_reset()
-    middle.grid_columnconfigure(0, weight=1)
-    middle.grid_rowconfigure(8, weight=1)
-    header.grid(column=0, row=0, sticky="ew", pady=(0,16))
-    settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
-    settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
-    settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
-    if option == 1:
-        water_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
-        water_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+#======================================================= EDITOR
+ED_HUES = (("Red", (1.0, 0.25, 0.2)), ("Orange", (1.0, 0.6, 0.2)), ("Yellow", (1.0, 0.9, 0.3)), ("Green", (0.3, 0.85, 0.4)), ("Teal", (0.2, 0.8, 0.8)), ("Blue", (0.3, 0.5, 1.0)), ("Purple", (0.6, 0.35, 0.95)), ("Pink", (1.0, 0.45, 0.75)))
+ED_LOOK = ("exposure", "brilliance", "highlights", "shadows", "contrast", "blackpoint", "fade", "saturation", "vibrancy", "warmth", "tint", "hue_amount", "sharpness", "definition", "noise", "vignette", "tilt", "tilt_pos")
+ED_DEFAULT = {"turns": 0, "flip_h": False, "flip_v": False, "angle": 0.0, "crop": None, "hue": 0}
+ED_DEFAULT.update({k: 0.0 for k in ED_LOOK})
+ED_GROUPS = (
+    ("Light", (("exposure", "Exposure", -1.0, 1.0), ("brilliance", "Brilliance", -1.0, 1.0), ("highlights", "Highlights", -1.0, 1.0), ("shadows", "Shadows", -1.0, 1.0), ("contrast", "Contrast", -1.0, 1.0), ("blackpoint", "Black point", -1.0, 1.0), ("fade", "Fade", 0.0, 1.0))),
+    ("Colour", (("saturation", "Saturation", -1.0, 1.0), ("vibrancy", "Vibrancy", -1.0, 1.0), ("warmth", "Warmth", -1.0, 1.0), ("tint", "Tint", -1.0, 1.0), ("hue_amount", "Colour wash", 0.0, 1.0))),
+    ("Detail", (("sharpness", "Sharpness", 0.0, 1.0), ("definition", "Definition", -1.0, 1.0), ("noise", "Noise reduction", 0.0, 1.0))),
+    ("Effects", (("vignette", "Vignette", -1.0, 1.0), ("tilt", "Tilt shift", 0.0, 1.0), ("tilt_pos", "Tilt position", -1.0, 1.0))),
+)
+ED_RATIOS = {"Free": None, "Original": "orig", "1:1": 1.0, "4:5": 4 / 5, "5:4": 5 / 4, "3:2": 3 / 2, "2:3": 2 / 3, "16:9": 16 / 9, "9:16": 9 / 16}
+ED_SAVE_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP", ".tif": "TIFF", ".tiff": "TIFF", ".bmp": "BMP"}
+ED_FOLDER = "edited_specorde"
+ED_PRESET_HINT = "Choose a look..."
+ED_BUILTIN = {
+    "Normal": {},
+    "Vivid": {"vibrancy": 0.5, "saturation": 0.15, "contrast": 0.2, "definition": 0.3, "sharpness": 0.25},
+    "Warm glow": {"warmth": 0.4, "exposure": 0.1, "fade": 0.2, "highlights": -0.2, "tint": 0.1},
+    "Cool": {"warmth": -0.4, "tint": -0.1, "contrast": 0.1, "saturation": -0.05},
+    "Faded film": {"fade": 0.55, "contrast": -0.15, "saturation": -0.2, "warmth": 0.15, "vignette": 0.25},
+    "Punchy": {"contrast": 0.4, "blackpoint": 0.3, "definition": 0.4, "vibrancy": 0.3, "shadows": 0.15},
+    "Mono": {"saturation": -1.0, "contrast": 0.3, "definition": 0.3, "vignette": 0.2},
+    "Soft dream": {"brilliance": 0.3, "fade": 0.25, "definition": -0.3, "warmth": 0.15, "highlights": -0.15},
+    "Miniature": {"tilt": 0.6, "saturation": 0.3, "contrast": 0.15, "sharpness": 0.3},
+}
+presets_file = path / "presets.json"
+
+def ed_presets_load():
+    try:
+        with open(presets_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+ed_presets = ed_presets_load()
+
+def ed_presets_save():
+    tmp = presets_file.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(ed_presets, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, presets_file)
+    except OSError:
+        logging.exception("Could not save the presets.")
+
+def ed_copy(st):
+    out = dict(st)
+    out["crop"] = list(st["crop"]) if st["crop"] else None
+    return out
+
+def ed_background(w, h):
+    gradient = Image.linear_gradient("L").resize((w, h), Image.BILINEAR)
+    return ImageOps.colorize(gradient, black="#1c1e2b", white="#0f1017")
+
+def ed_look_active(st):
+    return any(abs(st[k]) > 0.001 for k in ED_LOOK)
+
+def ed_lum(a):
+    return a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+def ed_denoise(img, amount):
+    r = max(0.5, amount * max(img.size) / 700)
+    y, cb, cr = img.convert("YCbCr").split()
+    cb = cb.filter(ImageFilter.GaussianBlur(r))
+    cr = cr.filter(ImageFilter.GaussianBlur(r))
+    y = Image.blend(y, y.filter(ImageFilter.GaussianBlur(r * 0.5)), min(1.0, amount * 0.6))
+    return Image.merge("YCbCr", (y, cb, cr)).convert("RGB")
+
+def ed_adjust(img, st):
+    if not ed_look_active(st):
+        return img
+    w, h = img.size
+    big = max(w, h)
+    if st["noise"] > 0.001:
+        img = ed_denoise(img, st["noise"])
+    sharp, defin = st["sharpness"], st["definition"]
+    fine = coarse = None
+    if abs(sharp) > 0.001 or abs(defin) > 0.001:
+        lum8 = img.convert("L")
+        if abs(sharp) > 0.001:
+            fine = np.asarray(lum8.filter(ImageFilter.GaussianBlur(max(0.6, big / 1100))))
+        if abs(defin) > 0.001:
+            coarse = np.asarray(lum8.filter(ImageFilter.GaussianBlur(max(3.0, big / 70))))
+    src = np.asarray(img)
+    out = np.empty((h, w, 3), np.uint8)
+    xs = np.linspace(-1, 1, w, dtype=np.float32)
+    ys = np.linspace(-1, 1, h, dtype=np.float32)
+    colour = np.array(ED_HUES[int(st["hue"]) % len(ED_HUES)][1], np.float32)
+    colour = colour / float(colour @ np.array([0.299, 0.587, 0.114], np.float32))
+    step = max(64, 1_500_000 // w)
+    for y0 in range(0, h, step):
+        y1 = min(h, y0 + step)
+        a = src[y0:y1].astype(np.float32) * (1 / 255)
+        lum0 = ed_lum(a)
+        if abs(st["exposure"]) > 0.001:
+            a *= 2.0 ** (st["exposure"] * 1.5)
+        bp = st["blackpoint"] * 0.15
+        if abs(bp) > 0.0005:
+            a = (a - bp) / (1.0 - bp)
+        np.clip(a, 0, 1, out=a)
+        hl, sh, br = st["highlights"], st["shadows"], st["brilliance"]
+        if abs(hl) > 0.001 or abs(sh) > 0.001 or abs(br) > 0.001:
+            lum = ed_lum(a)
+            gain = 1 + hl * 0.45 * lum ** 2 + sh * 0.45 * (1 - lum) ** 2 + br * (0.3 * (1 - lum) ** 1.5 - 0.12 * lum ** 2)
+            a *= gain[..., None]
+        if st["fade"] > 0.001:
+            a += (1 - a) * (st["fade"] * 0.16)
+        if abs(st["contrast"]) > 0.001:
+            a = (a - 0.5) * (1 + 0.8 * st["contrast"]) + 0.5
+        if fine is not None:
+            a += (sharp * 1.5) * (lum0 - fine[y0:y1] * (1 / 255))[..., None]
+        if coarse is not None:
+            a += (defin * 0.9) * (lum0 - coarse[y0:y1] * (1 / 255))[..., None]
+        np.clip(a, 0, 1, out=a)
+        sat, vib = st["saturation"], st["vibrancy"]
+        if abs(sat) > 0.001 or abs(vib) > 0.001:
+            lum = ed_lum(a)[..., None]
+            s = 1.0 + sat
+            if abs(vib) > 0.001:
+                s = s + vib * ((1 - (a.max(axis=2) - a.min(axis=2))) ** 2)[..., None]
+            a = lum + (a - lum) * s
+        if abs(st["warmth"]) > 0.001:
+            a[..., 0] *= 1 + 0.22 * st["warmth"]
+            a[..., 2] *= 1 - 0.22 * st["warmth"]
+        if abs(st["tint"]) > 0.001:
+            a[..., 1] *= 1 - 0.14 * st["tint"]
+            a[..., 0] *= 1 + 0.05 * st["tint"]
+            a[..., 2] *= 1 + 0.05 * st["tint"]
+        if st["hue_amount"] > 0.001:
+            wash = np.clip(ed_lum(a)[..., None] * colour, 0, 1)
+            a += (wash - a) * (0.45 * st["hue_amount"])
+        vg = st["vignette"]
+        if abs(vg) > 0.001:
+            r2 = (ys[y0:y1, None] ** 2 + xs[None, :] ** 2) * 0.5
+            m = np.clip((r2 - 0.25) / 0.75, 0, 1)
+            m = (m * m * (3 - 2 * m))[..., None]
+            if vg > 0:
+                a *= 1 - 0.85 * vg * m
+            else:
+                a += (1 - a) * (-vg * 0.7) * m
+        np.clip(a, 0, 1, out=a)
+        out[y0:y1] = (a * 255 + 0.5).astype(np.uint8)
+    res = Image.fromarray(out)
+    if st["tilt"] > 0.001:
+        blurred = res.filter(ImageFilter.GaussianBlur(max(1.0, st["tilt"] * big / 55)))
+        centre = 0.5 + 0.35 * st["tilt_pos"]
+        dist = np.abs(np.linspace(0, 1, h, dtype=np.float32) - centre)
+        m = np.clip((dist - 0.12) / 0.28, 0, 1)
+        m = m * m * (3 - 2 * m)
+        mask = Image.fromarray((m * 255).astype(np.uint8).reshape(h, 1)).resize((w, h), Image.NEAREST)
+        res = Image.composite(blurred, res, mask)
+    return res
+
+def ed_inscribed(w, h, angle):
+    a = math.radians(abs(angle))
+    s, c = abs(math.sin(a)), abs(math.cos(a))
+    if s < 1e-9:
+        return w, h
+    long_side, short_side = (w, h) if w >= h else (h, w)
+    if short_side <= 2 * s * c * long_side or abs(s - c) < 1e-10:
+        x = 0.5 * short_side
+        return (x / s, x / c) if w >= h else (x / c, x / s)
+    cos2 = c * c - s * s
+    return (w * c - h * s) / cos2, (h * c - w * s) / cos2
+
+def ed_render(img, st, crop=True, adjust=True):
+    out = img
+    turns = st["turns"] % 4
+    if turns:
+        out = out.transpose({1: Image.Transpose.ROTATE_270, 2: Image.Transpose.ROTATE_180, 3: Image.Transpose.ROTATE_90}[turns])
+    if st["flip_h"]:
+        out = ImageOps.mirror(out)
+    if st["flip_v"]:
+        out = ImageOps.flip(out)
+    angle = st["angle"]
+    if abs(angle) >= 0.01:
+        w, h = out.size
+        rotated = out.rotate(angle, resample=Image.BICUBIC)
+        cw, ch = ed_inscribed(w, h, angle)
+        cw, ch = max(1, int(cw)), max(1, int(ch))
+        x, y = (w - cw) // 2, (h - ch) // 2
+        out = rotated.crop((x, y, x + cw, y + ch))
+    if crop and st["crop"]:
+        w, h = out.size
+        l, t, r, b = st["crop"]
+        box = (round(l * w), round(t * h), round(r * w), round(b * h))
+        if box[2] - box[0] >= 1 and box[3] - box[1] >= 1:
+            out = out.crop(box)
+    if adjust:
+        out = ed_adjust(out, st)
+    return out.copy() if out is img else out
+def ed_crop_move(box, kind):
+    l, t, r, b = box
+    if kind == "cw":
+        return [1 - b, l, 1 - t, r]
+    if kind == "ccw":
+        return [t, 1 - r, b, 1 - l]
+    if kind == "flip_h":
+        return [1 - r, t, 1 - l, b]
+    return [l, 1 - b, r, 1 - t]
+
+def ed_box_resize(box, hl, hr, ht, hb, x, y, dw, dh, ratio, mn=24):
+    l, t, r, b = box
+    x = min(max(x, 0), dw)
+    y = min(max(y, 0), dh)
+    if hl:
+        l = min(x, r - mn)
+    if hr:
+        r = max(x, l + mn)
+    if ht:
+        t = min(y, b - mn)
+    if hb:
+        b = max(y, t + mn)
+    if not ratio:
+        return [l, t, r, b]
+    dx = -1 if hl else 1 if hr else 0
+    dy = -1 if ht else 1 if hb else 0
+    ax = r if dx < 0 else l if dx > 0 else (l + r) / 2
+    ay = b if dy < 0 else t if dy > 0 else (t + b) / 2
+    w, h = r - l, b - t
+    if dx and not dy:
+        h = w / ratio
+    elif dy and not dx:
+        w = h * ratio
     else:
-        find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
-        find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
-        sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
-        sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
-        rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
-        rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
-    currently_open = 1
+        w = max(w, h * ratio)
+        h = w / ratio
+    room_w = ax if dx < 0 else dw - ax if dx > 0 else 2 * min(ax, dw - ax)
+    room_h = ay if dy < 0 else dh - ay if dy > 0 else 2 * min(ay, dh - ay)
+    s = min(1.0, room_w / w, room_h / h)
+    if s * min(w, h) < 4:
+        return list(box)
+    w, h = w * s, h * s
+    l = ax - w if dx < 0 else ax if dx > 0 else ax - w / 2
+    t = ay - h if dy < 0 else ay if dy > 0 else ay - h / 2
+    return [l, t, l + w, t + h]
 
-def settings_change(option=0):
-    settings_open(option)
+def ed_cursor(kind):
+    if kind[0] == "move":
+        return "fleur"
+    if kind[0] == "new":
+        return "crosshair"
+    _, hl, hr, ht, hb = kind
+    if (hl and ht) or (hr and hb):
+        return "size_nw_se"
+    if (hl and hb) or (hr and ht):
+        return "size_ne_sw"
+    return "size_we" if (hl or hr) else "size_ns"
 
-def tutorial_open():
-    global middle
-    global currently_open
-    if not currently_open == 2:
-        middle_reset()
-    middle.grid_columnconfigure(0, weight=1)
-    header.grid(column=0, row=0,sticky="ew", pady=(0,24))
-    tutorial_label.grid(sticky="nw", pady=18, padx=18)
-    folder_browser.grid(row=0, column=0, columnspan=2, sticky="e", pady=(24,18), padx=(4,240))
-    folder_chosen.grid(row=0, column=0, columnspan=2, sticky="w", pady=(24,18), padx=(444,8))
-    tutorial_frame.grid(row=1, column=0, sticky="nw", padx=(18, 6))
-    currently_open = 2 #(0 for organize, 1 for settings, 2 for tutorial)
+def ed_exif(file):
+    try:
+        with Image.open(file) as im:
+            exif = im.getexif()
+            if not exif:
+                return None
+            try:
+                exif.get_ifd(0x8769)
+            except Exception:
+                pass
+            exif[274] = 1
+            return exif.tobytes()
+    except Exception:
+        return None
+
+def ed_small(img):
+    w, h = img.size
+    crop = img.crop((w // 8, h // 8, w - w // 8, h - h // 8))
+    crop.thumbnail((256, 256))
+    return crop
+
+def ed_stats_small(small):
+    a = np.asarray(small, np.float32) / 255
+    lum = ed_lum(a)
+    lo, hi = np.percentile(lum, [5, 95])
+    return {"median": min(max(float(np.median(lum)), 0.03), 0.97), "spread": max(float(hi - lo), 0.05), "chroma": float((a.max(axis=2) - a.min(axis=2)).mean())}
+
+def ed_stats(img):
+    return ed_stats_small(ed_small(img))
+
+def ed_normalise(img, t):
+    small = ed_small(img)
+    cur = ed_stats_small(small)
+    g = min(max(math.log(t["median"]) / math.log(cur["median"]), 0.4), 2.5)
+    gam = [(i / 255) ** g for i in range(256)]
+    first = small.point([round(255 * v) for v in gam] * 3)
+    spread = min(max(t["spread"] / ed_stats_small(first)["spread"], 0.6), 1.6)
+    mid = t["median"]
+    lut = [round(min(max((gam[i] - mid) * spread + mid, 0.0), 1.0) * 255) for i in range(256)]
+    chroma = ed_stats_small(small.point(lut * 3))["chroma"]
+    sat = min(max(t["chroma"] / max(chroma, 0.01), 0.6), 1.6)
+    out = img.point(lut * 3)
+    if abs(sat - 1) > 0.02:
+        out = ImageEnhance.Color(out).enhance(sat)
+    return out
+
+def ed_autobox(img):
+    small = img.copy()
+    small.thumbnail((256, 256))
+    a = np.asarray(small.convert("RGB"), np.float32)
+    h, w = a.shape[:2]
+    edge = np.concatenate([a[:5].reshape(-1, 3), a[-5:].reshape(-1, 3), a[:, :5].reshape(-1, 3), a[:, -5:].reshape(-1, 3)])
+    mask = np.abs(a - np.median(edge, axis=0)).sum(axis=2) > 70
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 0.02 * w * h:
+        return None
+    l, r = np.percentile(xs, [0.5, 99.5])
+    t, b = np.percentile(ys, [0.5, 99.5])
+    half = min(max(r - l, b - t) / 2 * 1.05, w / 2, h / 2)
+    cx = min(max((l + r) / 2, half), w - half)
+    cy = min(max((t + b) / 2, half), h - half)
+    return [(cx - half) / w, (cy - half) / h, (cx + half) / w, (cy + half) / h]
+
+def ed_geometry(img, st, centre):
+    out = ed_render(img, st, adjust=False)
+    if centre:
+        box = ed_autobox(out)
+        if box:
+            w, h = out.size
+            out = out.crop((round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)))
+    return out
+
+def ed_export(file, st, target=None, centre=False):
+    try:
+        big = 1 << 14
+        img = ed_geometry(load_image(file, (big, big), need=big), st, centre)
+        if target is not None:
+            img = ed_normalise(img, target)
+        img = ed_adjust(img, st)
+        folder = file.parent / ED_FOLDER
+        folder.mkdir(exist_ok=True)
+        ext = file.suffix.lower()
+        if ext not in ED_SAVE_FORMATS:
+            ext = ".jpg"
+        dest = folder / f"{file.stem}_edit{ext}"
+        n = 1
+        while dest.exists():
+            dest = folder / f"{file.stem}_edit_{n}{ext}"
+            n += 1
+        fmt = ED_SAVE_FORMATS[ext]
+        opts = {}
+        if fmt in ("JPEG", "WEBP"):
+            opts["quality"] = 95
+        if fmt == "JPEG":
+            opts["optimize"] = True
+        if fmt in ("JPEG", "WEBP", "PNG"):
+            exif = ed_exif(file)
+            if exif:
+                opts["exif"] = exif
+        tmp = dest.with_name(dest.name + ".tmp")
+        try:
+            img.save(tmp, format=fmt, **opts)
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        logging.info("Saved edited photo %s", dest)
+        return f"✓ Saved {dest.name}."
+    except Exception:
+        logging.exception("Could not save the edited photo %s.", file.name)
+        return "✗ Could not save the photo (see log)."
+
+pics_view = "grid"
+focus_mode = False
+
+class Editor:
+    def __init__(self, parent):
+        self.file = None
+        self.token = 0
+        self.st = ed_copy(ED_DEFAULT)
+        self.saved = ed_copy(self.st)
+        self.undo = []
+        self.redo = []
+        self.trial = None
+        self.skip_release = False
+        self.crop_mode = False
+        self.need_fit = False
+        self.box = None
+        self.drag = None
+        self.src = None
+        self.photo = None
+        self.disp = (0, 0, 1, 1)
+        self.job = None
+        self.sliders = {}
+        self.small = None
+        self.stage = None
+        self.stage_key = None
+        self.swatches = []
+        self.build(parent)
+
+    def dirty(self):
+        return self.file is not None and self.st != self.saved
+
+    def build(self, parent):
+        s = ui_scale()
+        self.cw, self.ch = round(610 * s), round(436 * s)
+        self.bg = ed_background(self.cw, self.ch)
+        frame = ctk.CTkFrame(parent, fg_color="#14151c", corner_radius=0)
+        self.frame = frame
+        self.win = frame
+        self.cv = tk.Canvas(frame, width=self.cw, height=self.ch, bg="#14151c", highlightthickness=0, bd=0)
+        self.cv.grid(row=0, column=0, padx=(12, 6), pady=(6, 2))
+        self.info = tk.Label(frame, text="", bg="#14151c", fg="#8f95a8", font=(UI_FONT, 12))
+        self.info.grid(row=1, column=0, pady=(0, 6))
+        panel = ctk.CTkFrame(frame, fg_color="#1b1d27", corner_radius=0)
+        panel.grid(row=0, column=1, rowspan=2, sticky="ns")
+        panel.grid_columnconfigure(0, minsize=254)
+        font = (UI_FONT, 13)
+
+        def make_button(master, text, command, width, **extra):
+            return ctk.CTkButton(master, text=text, command=command, font=font, width=width, height=24, **extra)
+
+        actions = ctk.CTkFrame(panel, fg_color="transparent")
+        actions.grid(row=0, column=0, padx=10, pady=(10, 0), sticky="w")
+        ctk.CTkButton(actions, text="Save a copy", command=self.save, font=(UI_FONT, 15), width=118, height=30, fg_color="#2e8b57", hover_color="#37a367").grid(row=0, column=0, padx=(0, 6))
+        ctk.CTkButton(actions, text="Bulk edit...", command=lambda: bulk_open(bulk_files()), font=(UI_FONT, 15), width=112, height=30).grid(row=0, column=1)
+        top = ctk.CTkFrame(panel, fg_color="transparent")
+        top.grid(row=1, column=0, padx=10, pady=(8, 0), sticky="w")
+        self.undo_button = make_button(top, "Undo", self.do_undo, 68)
+        self.redo_button = make_button(top, "Redo", self.do_redo, 68)
+        self.reset_button = make_button(top, "Reset look", self.reset_look, 88)
+        self.undo_button.grid(row=0, column=0, padx=(0, 5))
+        self.redo_button.grid(row=0, column=1, padx=(0, 5))
+        self.reset_button.grid(row=0, column=2)
+        presets = ctk.CTkFrame(panel, fg_color="transparent")
+        presets.grid(row=2, column=0, padx=10, pady=(8, 0), sticky="w")
+        self.preset_menu = ctk.CTkOptionMenu(presets, values=self.preset_labels(), command=self.preset_pick, font=font, width=134, height=24, dynamic_resizing=False)
+        self.preset_menu.set(ED_PRESET_HINT)
+        self.preset_menu.grid(row=0, column=0, padx=(0, 5))
+        make_button(presets, "Save", self.preset_save, 50).grid(row=0, column=1, padx=(0, 5))
+        make_button(presets, "Del", self.preset_delete, 40, fg_color="#8b2e2e", hover_color="#a33b3b").grid(row=0, column=2)
+        body = ctk.CTkScrollableFrame(panel, width=222, height=300, fg_color="transparent", scrollbar_button_color="#2c3043", scrollbar_button_hover_color="#3a4060")
+        body.grid(row=3, column=0, padx=(6, 2), pady=(6, 10), sticky="n")
+
+        def heading(text, row):
+            ctk.CTkLabel(body, text=text.upper(), font=(UI_FONT, 13), text_color="#4da3ff").grid(row=row, column=0, padx=6, pady=(14, 0), sticky="w")
+
+        row = 0
+        heading("Geometry", row)
+        row += 1
+        rot = ctk.CTkFrame(body, fg_color="transparent")
+        rot.grid(row=row, column=0, padx=2, pady=(6, 0), sticky="w")
+        row += 1
+        for col, (text, command) in enumerate((("Left", lambda: self.rotate(-1)), ("Right", lambda: self.rotate(1)), ("Flip H", lambda: self.flip("flip_h")), ("Flip V", lambda: self.flip("flip_v")))):
+            make_button(rot, text, command, 48).grid(row=0, column=col, padx=(0, 4))
+        crop_row = ctk.CTkFrame(body, fg_color="transparent")
+        crop_row.grid(row=row, column=0, padx=2, pady=(6, 0), sticky="w")
+        row += 1
+        self.crop_button = make_button(crop_row, "Crop", self.crop_start, 60)
+        self.crop_button.grid(row=0, column=0, padx=(0, 5))
+        self.ratio_menu = ctk.CTkOptionMenu(crop_row, values=list(ED_RATIOS), command=self.ratio_changed, font=font, width=126, height=24, dynamic_resizing=False)
+        self.ratio_menu.set("Free")
+        self.ratio_menu.grid(row=0, column=1)
+        self.crop_actions = ctk.CTkFrame(body, fg_color="transparent")
+        self.crop_actions_row = row
+        row += 1
+        make_button(self.crop_actions, "Apply", lambda: self.crop_end(True), 60, fg_color="#2e8b57").grid(row=0, column=0, padx=(0, 5))
+        make_button(self.crop_actions, "Cancel", lambda: self.crop_end(False), 60).grid(row=0, column=1, padx=(0, 5))
+        make_button(self.crop_actions, "Whole", self.crop_whole, 60).grid(row=0, column=2)
+        self.add_slider(body, row, "angle", "Straighten", -15.0, 15.0)
+        row += 2
+        for title, items in ED_GROUPS:
+            heading(title, row)
+            row += 1
+            for key, text, lo, hi in items:
+                if key == "hue_amount":
+                    swatch_row = ctk.CTkFrame(body, fg_color="transparent")
+                    swatch_row.grid(row=row, column=0, padx=6, pady=(8, 0), sticky="w")
+                    row += 1
+                    for i, (name, rgb) in enumerate(ED_HUES):
+                        colour = "#%02x%02x%02x" % tuple(int(c * 255) for c in rgb)
+                        button = ctk.CTkButton(swatch_row, text="", width=20, height=20, corner_radius=10, fg_color=colour, hover_color=colour, border_width=0, border_color="#ffffff", command=lambda i=i: self.commit("hue", i))
+                        button.grid(row=0, column=i, padx=(0, 4))
+                        self.swatches.append(button)
+                self.add_slider(body, row, key, text, lo, hi)
+                row += 2
+        self.cv.bind("<ButtonPress-1>", self.cv_press)
+        self.cv.bind("<B1-Motion>", self.cv_drag)
+        self.cv.bind("<ButtonRelease-1>", self.cv_release)
+        self.cv.bind("<Motion>", self.cv_motion)
+        self.sync()
+
+    def add_slider(self, master, row, key, text, lo, hi):
+        head = ctk.CTkFrame(master, fg_color="transparent")
+        head.grid(row=row, column=0, padx=6, pady=(8, 0), sticky="ew")
+        head.grid_columnconfigure(0, weight=1)
+        label = ctk.CTkLabel(head, text=text, font=(UI_FONT, 14), anchor="w")
+        label.grid(row=0, column=0, sticky="w")
+        reset = ctk.CTkButton(head, text="↺", width=22, height=20, font=(UI_FONT, 13), fg_color="#2c3043", hover_color="#3a4060", command=lambda k=key: self.reset_one(k))
+        reset.grid(row=0, column=1, sticky="e")
+        slider = ctk.CTkSlider(master, from_=lo, to=hi, width=196, command=lambda v, k=key: self.slide(k, v))
+        slider.set(ED_DEFAULT[key])
+        slider.grid(row=row + 1, column=0, padx=6, sticky="w")
+        slider.bind("<ButtonRelease-1>", lambda e, k=key: self.slide_done(k))
+        slider.bind("<Double-Button-1>", lambda e, k=key: self.slide_reset(k))
+        self.sliders[key] = (slider, label, text, lo, reset)
+
+    def reset_one(self, key):
+        self.trial = None
+        self.commit(key, ED_DEFAULT[key])
+
+    def rescale(self):
+        s = ui_scale()
+        self.cw, self.ch = round(610 * s), round(436 * s)
+        self.bg = ed_background(self.cw, self.ch)
+        self.cv.configure(width=self.cw, height=self.ch)
+        self.stage_key = None
+        self.refresh()
+
+    def open_file(self, file):
+        self.file = file
+        self.token += 1
+        token = self.token
+        self.st = ed_copy(ED_DEFAULT)
+        self.saved = ed_copy(self.st)
+        self.undo = []
+        self.redo = []
+        self.trial = None
+        self.src = None
+        self.small = None
+        self.stage_key = None
+        self.crop_mode = False
+        self.drag = None
+        self.box = None
+        self.crop_actions.grid_forget()
+        self.crop_button.configure(state="normal")
+        self.preset_menu.set(ED_PRESET_HINT)
+        self.cv.delete("all")
+        self.cv.configure(cursor="")
+        self.sync()
+        self.info.configure(text="Loading...")
+        side = int(max(self.cw, self.ch) * 1.5)
+        holder = {}
+
+        def work():
+            try:
+                img = load_image(file, (side * 2, side * 2), need=side)
+                img.thumbnail((side, side), Image.BILINEAR)
+                holder["img"] = img
+            except Exception:
+                logging.exception("Could not open %s for editing.", file.name)
+                holder["img"] = False
+
+        def poll():
+            if token != self.token:
+                return
+            try:
+                if "img" not in holder:
+                    self.frame.after(60, poll)
+                    return
+                if holder["img"] is False:
+                    messagebox.showwarning("Specorde", "Could not open this photo for editing.")
+                    editor_back(True)
+                    return
+                self.src = holder["img"]
+                self.small = self.src.copy()
+                side = round(max(self.cw, self.ch) * 1.05)
+                self.small.thumbnail((side, side), Image.BILINEAR)
+                self.refresh()
+            except Exception:
+                logging.exception("Editor loading check failed.")
+
+        threading.Thread(target=work, daemon=True).start()
+        self.frame.after(60, poll)
+
+    # ---- presets
+    def preset_labels(self):
+        return [ED_PRESET_HINT] + list(ED_BUILTIN) + ["★ " + name for name in ed_presets]
+
+    def preset_refresh(self, selected):
+        self.preset_menu.configure(values=self.preset_labels())
+        self.preset_menu.set(selected)
+
+    def preset_pick(self, label):
+        if label == ED_PRESET_HINT:
+            return
+        if label in ED_BUILTIN:
+            look = ED_BUILTIN[label]
+        else:
+            look = ed_presets.get(label[2:] if label.startswith("★ ") else label)
+        if look is None:
+            return
+        if self.crop_mode:
+            self.crop_end(False)
+        self.push()
+        for key in ED_LOOK:
+            self.st[key] = 0.0
+        self.st["hue"] = int(look.get("hue", 0))
+        for key, value in look.items():
+            if key in ED_LOOK:
+                self.st[key] = float(value)
+        self.sync()
+
+    def preset_save(self):
+        look = {k: round(self.st[k], 3) for k in ED_LOOK if abs(self.st[k]) > 0.001}
+        if not look:
+            messagebox.showinfo("Specorde", "Nothing to save yet. Move some sliders first.")
+            return
+        look["hue"] = int(self.st["hue"])
+        name = (ctk.CTkInputDialog(text="Name for this look (max 24 characters):", title="Save look").get_input() or "").strip()[:24]
+        if not name:
+            return
+        if name in ED_BUILTIN:
+            messagebox.showwarning("Specorde", "That name belongs to a built-in look. Pick another one.")
+            return
+        ed_presets[name] = look
+        ed_presets_save()
+        self.preset_refresh("★ " + name)
+
+    def preset_delete(self):
+        label = self.preset_menu.get()
+        if not label.startswith("★ "):
+            messagebox.showinfo("Specorde", "Pick one of your own looks (marked with a star) to delete it.")
+            return
+        name = label[2:]
+        if name in ed_presets and messagebox.askyesno("Specorde", f"Delete the look '{name}'?"):
+            del ed_presets[name]
+            ed_presets_save()
+            self.preset_refresh(ED_PRESET_HINT)
+
+    def reset_look(self):
+        if self.crop_mode:
+            self.crop_end(False)
+        if ed_look_active(self.st):
+            self.push()
+            for key in ED_LOOK:
+                self.st[key] = 0.0
+            self.sync()
+        self.preset_menu.set(ED_PRESET_HINT)
+
+    # ---- state
+    def push(self):
+        self.undo.append(ed_copy(self.st))
+        del self.undo[:-100]
+        self.redo.clear()
+
+    def sync(self):
+        for key, (slider, label, text, lo, reset) in self.sliders.items():
+            slider.set(self.st[key])
+            self.value_label(key, self.st[key])
+            reset.configure(state="normal" if abs(self.st[key] - ED_DEFAULT[key]) > 0.001 else "disabled")
+        for i, button in enumerate(self.swatches):
+            button.configure(border_width=2 if i == int(self.st["hue"]) else 0)
+        self.undo_button.configure(state="normal" if self.undo else "disabled")
+        self.redo_button.configure(state="normal" if self.redo else "disabled")
+        self.reset_button.configure(state="normal" if ed_look_active(self.st) else "disabled")
+        self.refresh()
+
+    def value_label(self, key, value):
+        slider, label, text, lo, reset = self.sliders[key]
+        if key == "angle":
+            shown = f"{value:+.1f}°"
+        elif lo < 0:
+            shown = f"{round(value * 100):+d}"
+        else:
+            shown = f"{round(value * 100)}"
+        label.configure(text=f"{text}   {shown}")
+
+    def commit(self, key, value):
+        if self.st[key] != value:
+            self.push()
+            self.st[key] = value
+        self.sync()
+
+    def do_undo(self):
+        if self.crop_mode:
+            self.crop_end(False)
+        if self.undo:
+            self.redo.append(ed_copy(self.st))
+            self.st = self.undo.pop()
+            self.sync()
+
+    def do_redo(self):
+        if self.crop_mode:
+            self.crop_end(False)
+        if self.redo:
+            self.undo.append(ed_copy(self.st))
+            self.st = self.redo.pop()
+            self.sync()
+
+    # ---- sliders
+    def slide(self, key, value):
+        value = round(float(value), 2)
+        self.trial = ed_copy(self.st)
+        self.trial[key] = value
+        self.value_label(key, value)
+        if self.job is None:
+            self.job = self.win.after(30, self.refresh)
+
+    def slide_done(self, key):
+        if self.skip_release:
+            self.skip_release = False
+            self.trial = None
+            self.refresh()
+            return
+        if self.trial is None:
+            return
+        value = self.trial[key]
+        self.trial = None
+        self.commit(key, value)
+
+    def slide_reset(self, key):
+        self.skip_release = True
+        self.trial = None
+        self.commit(key, ED_DEFAULT[key])
+
+    # ---- rotate / flip
+    def rotate(self, d):
+        self.crop_end(True)
+        st = self.st
+        self.push()
+        mirrored = st["flip_h"] != st["flip_v"]
+        st["turns"] = (st["turns"] + (-d if mirrored else d)) % 4
+        if st["crop"]:
+            st["crop"] = ed_crop_move(st["crop"], "cw" if d > 0 else "ccw")
+        self.sync()
+
+    def flip(self, key):
+        self.crop_end(True)
+        st = self.st
+        self.push()
+        st[key] = not st[key]
+        st["angle"] = -st["angle"]
+        if st["crop"]:
+            st["crop"] = ed_crop_move(st["crop"], key)
+        self.sync()
+
+    # ---- drawing
+    def refresh(self):
+        self.job = None
+        if self.src is None:
+            return
+        st = self.trial or self.st
+        fast = self.trial is not None and self.small is not None
+        base = self.small if fast else self.src
+        try:
+            img = ed_render(base, st, crop=not self.crop_mode)
+        except Exception:
+            logging.exception("Could not draw the preview.")
+            return
+        iw, ih = img.size
+        scale = min((self.cw - 28) / iw, (self.ch - 28) / ih)
+        dw, dh = max(1, round(iw * scale)), max(1, round(ih * scale))
+        ox, oy = (self.cw - dw) // 2, (self.ch - dh) // 2
+        self.disp = (ox, oy, dw, dh)
+        key = (self.cw, self.ch, ox, oy, dw, dh)
+        if key != self.stage_key:
+            stage = self.bg.copy()
+            shadow = Image.new("L", stage.size, 0)
+            ImageDraw.Draw(shadow).rectangle((ox + 2, oy + 8, ox + dw + 2, oy + dh + 8), fill=170)
+            shadow = shadow.filter(ImageFilter.GaussianBlur(10))
+            stage.paste((0, 0, 0), (0, 0) + stage.size, shadow)
+            ImageDraw.Draw(stage).rectangle((ox - 1, oy - 1, ox + dw, oy + dh), outline="#2f3347")
+            self.stage = stage
+            self.stage_key = key
+        view = self.stage.copy()
+        view.paste(img.resize((dw, dh), Image.BILINEAR), (ox, oy))
+        self.photo = ImageTk.PhotoImage(view)
+        self.cv.delete("all")
+        self.cv.create_image(0, 0, image=self.photo, anchor="nw")
+        if self.crop_mode:
+            if self.need_fit:
+                self.need_fit = False
+                self.box_fit()
+            self.draw_box()
+            text = "Drag the corners, edges or the inside · Enter applies · Esc cancels"
+        else:
+            text = "C crop · Ctrl+Z undo · Ctrl+Y redo · Ctrl+S save · Esc back · double-click a slider to reset it"
+        self.info.configure(text=text)
+
+    def draw_box(self):
+        ox, oy, dw, dh = self.disp
+        l, t, r, b = self.box
+        x1, y1, x2, y2 = ox + l * dw, oy + t * dh, ox + r * dw, oy + b * dh
+        for rect in ((ox, oy, ox + dw, y1), (ox, y2, ox + dw, oy + dh), (ox, y1, x1, y2), (x2, y1, ox + dw, y2)):
+            self.cv.create_rectangle(*rect, fill="#000000", stipple="gray50", outline="", tags="box")
+        for k in (1, 2):
+            self.cv.create_line(x1 + (x2 - x1) * k / 3, y1, x1 + (x2 - x1) * k / 3, y2, fill="#8a8f9c", tags="box")
+            self.cv.create_line(x1, y1 + (y2 - y1) * k / 3, x2, y1 + (y2 - y1) * k / 3, fill="#8a8f9c", tags="box")
+        self.cv.create_rectangle(x1, y1, x2, y2, outline="#ffd24a", width=2, tags="box")
+        for hx in (x1, (x1 + x2) / 2, x2):
+            for hy in (y1, (y1 + y2) / 2, y2):
+                if (hx, hy) != ((x1 + x2) / 2, (y1 + y2) / 2):
+                    self.cv.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill="#ffd24a", outline="#101117", tags="box")
+
+    # ---- crop
+    def ratio_value(self):
+        ratio = ED_RATIOS.get(self.ratio_menu.get())
+        if ratio == "orig":
+            return self.disp[2] / self.disp[3]
+        return ratio
+
+    def ratio_changed(self, choice=None):
+        if self.crop_mode:
+            self.need_fit = True
+            self.refresh()
+
+    def box_fit(self):
+        ratio = self.ratio_value()
+        if not ratio:
+            return
+        dw, dh = self.disp[2], self.disp[3]
+        l, t, r, b = self.box
+        bw, bh = (r - l) * dw, (b - t) * dh
+        if bw / bh > ratio:
+            nw, nh = bh * ratio, bh
+        else:
+            nw, nh = bw, bw / ratio
+        cx, cy = (l + r) / 2, (t + b) / 2
+        self.box = [cx - nw / dw / 2, cy - nh / dh / 2, cx + nw / dw / 2, cy + nh / dh / 2]
+
+    def crop_start(self):
+        if self.src is None or self.crop_mode:
+            return
+        self.crop_mode = True
+        self.need_fit = True
+        self.box = list(self.st["crop"]) if self.st["crop"] else [0.0, 0.0, 1.0, 1.0]
+        self.crop_actions.grid(row=self.crop_actions_row, column=0, padx=2, pady=(6, 0), sticky="w")
+        self.crop_button.configure(state="disabled")
+        self.refresh()
+
+    def crop_whole(self):
+        if self.crop_mode:
+            self.box = [0.0, 0.0, 1.0, 1.0]
+            self.need_fit = True
+            self.refresh()
+
+    def crop_end(self, apply):
+        if not self.crop_mode:
+            return
+        if apply:
+            new = [round(v, 5) for v in self.box]
+            if new[2] - new[0] > 0.999 and new[3] - new[1] > 0.999:
+                new = None
+            if new != self.st["crop"]:
+                self.push()
+                self.st["crop"] = new
+        self.crop_mode = False
+        self.drag = None
+        self.cv.configure(cursor="")
+        self.crop_actions.grid_forget()
+        self.crop_button.configure(state="normal")
+        self.sync()
+
+    def rel(self, e):
+        return e.x - self.disp[0], e.y - self.disp[1]
+
+    def hit(self, x, y):
+        dw, dh = self.disp[2], self.disp[3]
+        l, t, r, b = self.box[0] * dw, self.box[1] * dh, self.box[2] * dw, self.box[3] * dh
+        m = 12
+        in_x = l - m <= x <= r + m
+        in_y = t - m <= y <= b + m
+        hl = abs(x - l) <= m and in_y
+        hr = abs(x - r) <= m and in_y and not hl
+        ht = abs(y - t) <= m and in_x
+        hb = abs(y - b) <= m and in_x and not ht
+        if hl or hr or ht or hb:
+            return ("size", hl, hr, ht, hb)
+        if l <= x <= r and t <= y <= b:
+            return ("move",)
+        return ("new",)
+
+    def cv_motion(self, e):
+        if not self.crop_mode or self.box is None or self.drag is not None:
+            return
+        x, y = self.rel(e)
+        self.cv.configure(cursor=ed_cursor(self.hit(x, y)))
+
+    def cv_press(self, e):
+        canvas.focus_set()
+        if not self.crop_mode or self.box is None:
+            return
+        dw, dh = self.disp[2], self.disp[3]
+        x, y = self.rel(e)
+        kind = self.hit(x, y)
+        box = [self.box[0] * dw, self.box[1] * dh, self.box[2] * dw, self.box[3] * dh]
+        if kind[0] == "new":
+            x, y = min(max(x, 0), dw), min(max(y, 0), dh)
+            box = [x, y, x, y]
+        self.drag = {"kind": kind, "x": x, "y": y, "box": box}
+
+    def cv_drag(self, e):
+        d = self.drag
+        if d is None:
+            return
+        dw, dh = self.disp[2], self.disp[3]
+        x, y = self.rel(e)
+        l, t, r, b = d["box"]
+        if d["kind"][0] == "move":
+            w, h = r - l, b - t
+            nl = min(max(l + x - d["x"], 0), dw - w)
+            nt = min(max(t + y - d["y"], 0), dh - h)
+            new = [nl, nt, nl + w, nt + h]
+        else:
+            if d["kind"][0] == "new":
+                hl, ht = x < d["x"], y < d["y"]
+                flags = (hl, not hl, ht, not ht)
+            else:
+                flags = d["kind"][1:]
+            new = ed_box_resize(d["box"], *flags, x, y, dw, dh, self.ratio_value())
+        self.box = [new[0] / dw, new[1] / dh, new[2] / dw, new[3] / dh]
+        self.cv.delete("box")
+        self.draw_box()
+
+    def cv_release(self, e):
+        self.drag = None
+
+    # ---- save
+    def save(self):
+        if self.src is None or self.file is None:
+            return
+        self.crop_end(True)
+        file = self.file
+        st = ed_copy(self.st)
+        holder = {}
+        self.info.configure(text="Saving a copy...")
+        q.put(("status", "Saving photo..."))
+
+        def work():
+            holder["line"] = ed_export(file, st)
+
+        def poll():
+            global pics_stamp
+            if "line" not in holder:
+                canvas.after(150, poll)
+                return
+            ok = holder["line"].startswith("✓")
+            q.put(("summary_clear", None))
+            q.put(("summary_add", holder["line"]))
+            q.put(("summary_hide_later", None))
+            q.put(("status", "Photo saved!" if ok else "Saving failed. See log..."))
+            q.put(("status_reset", None))
+            if "target_folder" in globals() and file.parent == target_folder:
+                pics_stamp = folder_stamp()
+            if self.file == file:
+                if ok:
+                    self.saved = ed_copy(st)
+                self.info.configure(text=holder["line"])
+
+        threading.Thread(target=work, daemon=True).start()
+        canvas.after(150, poll)
+
+def ed_focus(on):
+    global focus_mode
+    if on == focus_mode:
+        return
+    focus_mode = on
+    if on:
+        left.grid_remove()
+        middle.configure(width=892)
+    else:
+        middle.configure(width=678)
+        left.grid()
+
+def editing():
+    return currently_open == 3 and pics_view == "edit" and ed_view.file is not None
+
+def editor_back(force=False):
+    global pics_view
+    if ed_view.crop_mode:
+        ed_view.crop_end(False)
+    if not force and ed_view.dirty():
+        if not messagebox.askyesno("Specorde", "Go back without saving your changes?"):
+            return
+    ed_view.file = None
+    ed_view.src = None
+    ed_view.token += 1
+    pics_view = "grid"
+    pictures_open()
+
+def editor_open(file):
+    global pics_view
+    file = Path(file)
+    if file.suffix.lower() not in pic_suffixes:
+        messagebox.showwarning("Specorde", "This file type can't be edited.")
+        return
+    if ed_view.file is not None and ed_view.file != file and ed_view.dirty():
+        if not messagebox.askyesno("Specorde", "Open another photo without saving your changes?"):
+            return
+    inspect_close_all()
+    compare_close()
+    peek_close()
+    if ed_view.file != file:
+        ed_view.open_file(file)
+    pics_view = "edit"
+    pictures_open()
+    canvas.focus_set()
+
+def edit_target():
+    if at_groups() or not cards:
+        return None
+    for card in cards:
+        if card[0] in marq_sel:
+            return card[0]
+    if sel_visible and sel_idx is not None:
+        return cards[min(sel_idx, len(cards) - 1)][0]
+    for card in cards:
+        if str(card[0]) in keep_set:
+            return card[0]
+    return best_file_now() or cards[0][0]
+
+def edit_current():
+    file = edit_target()
+    if file is not None:
+        editor_open(file)
+
+def bulk_files():
+    if marq_sel:
+        return [c[0] for c in cards if c[0] in marq_sel]
+    return kept_now()
+
+def key_edit():
+    if at_groups() or not cards or not sel_visible or sel_idx is None:
+        return
+    editor_open(cards[sel_idx][0])
+
+def edit_from_inspect(win):
+    st = inspect_state.get(win)
+    if st is None or st["file"] is None:
+        return
+    file = st["file"]
+    canvas.after(10, lambda: editor_open(file))
+
+def editor_key(event):
+    if focus_in_text():
+        return
+    key = event.keysym.lower()
+    if key == "c":
+        ed_view.crop_start()
+    elif key in ("return", "kp_enter"):
+        ed_view.crop_end(True)
+    elif key == "escape":
+        if ed_view.crop_mode:
+            ed_view.crop_end(False)
+        else:
+            editor_back()
+    elif key in ("f1", "question"):
+        keys_open()
+    else:
+        return
+    return "break"
+
+# ---- bulk editing
+def bulk_look_get(label):
+    look = ED_BUILTIN.get(label)
+    if look is None:
+        look = ed_presets.get(label[2:], {})
+    out = {k: float(look.get(k, 0.0)) for k in ED_LOOK}
+    out["hue"] = int(look.get("hue", 0))
+    return out
+
+def bulk_open(files=None):
+    if execute_button.cget("state") == "disabled":
+        messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
+        return
+    live = editing() and ed_view.src is not None
+    live_look = None
+    if live:
+        live_look = {k: ed_view.st[k] for k in ED_LOOK}
+        live_look["hue"] = ed_view.st["hue"]
+    win = ctk.CTkToplevel(canvas)
+    win.withdraw()
+    win.title("Bulk edit")
+    win.configure(fg_color="#1f2029")
+    win.resizable(False, False)
+    win.transient(canvas)
+    use_look = tk.BooleanVar(master=win, value=True)
+    use_match = tk.BooleanVar(master=win, value=True)
+    use_centre = tk.BooleanVar(master=win, value=False)
+    use_geo = tk.BooleanVar(master=win, value=False)
+
+    def go(chosen):
+        if not chosen:
+            return
+        st = ed_copy(ED_DEFAULT)
+        look = live_look if live else bulk_look_get(look_menu.get())
+        if use_look.get():
+            st.update(look)
+        if live and use_geo.get():
+            for key in ("turns", "flip_h", "flip_v", "angle"):
+                st[key] = ed_view.st[key]
+            st["crop"] = list(ed_view.st["crop"]) if ed_view.st["crop"] else None
+        if use_centre.get():
+            st["crop"] = None
+        target = None
+        if use_match.get():
+            try:
+                if live:
+                    ref = ed_view.src
+                else:
+                    ref = load_image(chosen[0], (640, 640))
+                    ref.thumbnail((640, 640))
+                target = ed_stats(ed_geometry(ref, st, use_centre.get()))
+            except Exception:
+                logging.exception("Could not measure the reference photo.")
+        if st == ed_copy(ED_DEFAULT) and target is None and not use_centre.get():
+            messagebox.showinfo("Specorde", "Tick at least one option.", parent=win)
+            return
+        win.destroy()
+        bulk_run(chosen, st, target, use_centre.get())
+
+    def pick_files():
+        picked = filedialog.askopenfilenames(parent=win, title="Choose photos", filetypes=[("Pictures", " ".join("*" + s for s in sorted(pic_suffixes))), ("All files", "*.*")])
+        if picked:
+            go([Path(c) for c in picked])
+
+    ctk.CTkLabel(win, text="Bulk edit", font=(UI_FONT, 24)).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 2))
+    ctk.CTkLabel(win, text="Copies go to 'edited_specorde' next to each photo. Originals are never changed.", font=(UI_FONT, 13), text_color="grey", wraplength=340, justify="left").grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
+    row = 2
+    if live:
+        match_text = "Match brightness to this photo (median)"
+        look_text = "Apply this photo's look"
+    else:
+        match_text = "Match brightness to the first photo (median)"
+        look_text = "Apply a look:"
+    ctk.CTkCheckBox(win, text=look_text, variable=use_look, font=(UI_FONT, 14)).grid(row=row, column=0, sticky="w", padx=20, pady=3)
+    row += 1
+    look_menu = ctk.CTkOptionMenu(win, values=list(ED_BUILTIN) + ["★ " + n for n in ed_presets], font=(UI_FONT, 13), width=340, height=24, dynamic_resizing=False)
+    look_menu.set("Normal")
+    if not live:
+        look_menu.grid(row=row, column=0, padx=20, pady=(0, 4))
+        row += 1
+    options = [(match_text, use_match), ("Auto-centre on the subject (square crop)", use_centre)]
+    if live:
+        options.append(("Also apply this photo's crop and rotation", use_geo))
+    for text, var in options:
+        ctk.CTkCheckBox(win, text=text, variable=var, font=(UI_FONT, 14)).grid(row=row, column=0, sticky="w", padx=20, pady=3)
+        row += 1
+    sources = []
+    if files:
+        sources.append((f"These {len(files)} photos", files))
+    if "target_folder" in globals():
+        kept = kept_now()
+        if kept:
+            sources.append((f"Kept photos ({len(kept)})", kept))
+        try:
+            everything = sorted(p for p in target_folder.iterdir() if p.is_file() and p.suffix.lower() in pic_suffixes and not is_protected_item(p))
+        except OSError:
+            everything = []
+        sources.append((f"All photos in the folder ({len(everything)})", everything))
+    for text, chosen in sources:
+        ctk.CTkButton(win, text=text, command=lambda c=chosen: go(c), state="normal" if chosen else "disabled", font=(UI_FONT, 14), width=340, height=28).grid(row=row, column=0, padx=20, pady=(8 if row == len(options) + 3 else 3, 3))
+        row += 1
+    ctk.CTkButton(win, text="Choose photos...", command=pick_files, font=(UI_FONT, 14), width=340, height=28).grid(row=row, column=0, padx=20, pady=3)
+    ctk.CTkButton(win, text="Cancel", command=win.destroy, font=(UI_FONT, 13), width=80, height=24, fg_color="#2c3043", hover_color="#3a4060").grid(row=row + 1, column=0, sticky="e", padx=20, pady=(8, 16))
+    center_on_main(win)
+    win.after(300, lambda: set_inspect_icon(win))
+    win.after(60, lambda: reveal(win))
+
+def bulk_run(files, st, target, centre):
+    if execute_button.cget("state") == "disabled":
+        messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
+        return
+    n = len(files)
+    if not messagebox.askyesno("Specorde", f"Edit {n} photo{'' if n == 1 else 's'}?\n\nNew copies go to 'edited_specorde' next to each photo. Your originals stay untouched.\n\nContinue?"):
+        return
+    lock_ui()
+    start_execute(lambda: bulk_work(files, st, target, centre))
+
+def bulk_work(files, st, target, centre):
+    global pics_stamp
+    q.put(("lock", None))
+    q.put(("summary_clear", None))
+    q.put(("bar_show", None))
+    q.put(("bar_text_show", None))
+    saved = 0
+    failed = 0
+    try:
+        bar_start()
+        total = len(files)
+        for number, file in enumerate(files, start=1):
+            if ed_export(file, st, target, centre).startswith("✓"):
+                saved += 1
+            else:
+                failed += 1
+            progress("Applying look...", number, total)
+    except Exception:
+        logging.exception("Bulk edit failed.")
+        failed += 1
+    finally:
+        logging.info("Bulk edit: %d saved, %d failed.", saved, failed)
+        text = f"✓ {saved} photo{'' if saved == 1 else 's'} saved to {ED_FOLDER}."
+        if failed:
+            text = f"✗ {saved} saved, {failed} failed."
+        if "target_folder" in globals():
+            pics_stamp = folder_stamp()
+        q.put(("bar_set", 1))
+        q.put(("bar_text", "100%"))
+        q.put(("summary_add", text))
+        q.put(("summary_hide_later", None))
+        q.put(("status", "Bulk edit done!" if not failed else "Done with errors. See log..."))
+        q.put(("status_reset", None))
+        q.put(("bar_text_destroy", None))
+        q.put(("bar_destroy", None))
+        q.put(("unlock", None))
+
+# ---- right-click menu and delete
+def delete_one(file):
+    global scan_order, pics_stamp
+    if execute_button.cget("state") == "disabled":
+        messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
+        return
+    if not messagebox.askyesno("Specorde", f"Send '{file.name}' to the Recycle Bin?\n\nSpecorde can't restore files from the Recycle Bin.\n\nContinue?"):
+        return
+    try:
+        send2trash(str(file))
+    except Exception:
+        logging.exception("Could not delete %s.", file.name)
+        messagebox.showwarning("Specorde", "Could not delete this photo.")
+        return
+    logging.info("Deleted %s (Recycle Bin).", file.name)
+    keep_set.discard(str(file))
+    done_set.discard(str(file))
+    keep_save()
+    done_save()
+    scan_order = [f for f in scan_order if f != file]
+    photo_info.pop(file, None)
+    pics_stamp = folder_stamp()
+    inspect_close_all()
+    compare_close()
+    if open_idx is not None:
+        rest = [f for f in groups[open_idx] if f != file]
+        if rest:
+            groups[open_idx] = rest
+            group_open(open_idx, switching=True)
+            return
+    groups_build()
+    groups_log()
+    header_show()
+    groups_show()
+
+def pic_context(event):
+    idx = card_at(event)
+    if idx is None:
+        if marq_sel:
+            marq_clear()
+        else:
+            group_close()
+        return
+    if at_singles() and marq_sel and cards[idx][0] not in marq_sel:
+        marq_clear()
+    menu = tk.Menu(canvas, tearoff=0, bg="#1f2029", fg="#e6e8f0", activebackground="#1f6aa5", activeforeground="white", bd=0, relief="flat", font=(UI_FONT, 12))
+    if at_groups():
+        menu.add_command(label="Open group", command=lambda: group_open(idx))
+        menu.add_command(label="Edit first photo", command=lambda: editor_open(cards[idx][0]))
+    else:
+        file = cards[idx][0]
+        menu.add_command(label="Open", command=lambda: inspect_show(idx))
+        menu.add_command(label="Edit", command=lambda: editor_open(file))
+        menu.add_command(label="Unkeep" if str(file) in keep_set else "Keep", command=lambda: keep_flip(idx))
+        menu.add_separator()
+        menu.add_command(label="Bulk edit...", command=lambda: bulk_open(bulk_files()))
+        menu.add_separator()
+        menu.add_command(label="Delete...", command=lambda: delete_one(file))
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        menu.grab_release()
+
+# ---- screen scale changes (moving the window to another monitor)
+scale_seen = 1.0
+
+def scale_watch():
+    global scale_seen
+    try:
+        s = ui_scale()
+        if abs(s - scale_seen) > 0.01:
+            scale_seen = s
+            schedule_refresh()
+            ed_view.rescale()
+    except Exception:
+        logging.exception("scale_watch failed")
+    canvas.after(700, scale_watch)
 
 def resource_path(name):
     if getattr(sys, "frozen", False):
@@ -3071,8 +5830,13 @@ except Exception:
 canvas.geometry("1152x648")
 #plain bind on purpose, prevents clipping when dragging between monitors
 canvas.bind("<Configure>", lambda event: None)
+canvas.bind("<Key>", key_press)
+canvas.bind("<KeyRelease>", key_release)
+canvas.bind("<FocusOut>", key_reset)
 canvas.resizable(width=False, height=False)
 def on_close():
+    if ed_view.dirty() and not messagebox.askyesno("Specorde", "You have unsaved edits. Quit anyway?"):
+        return
     if execute_button.cget("state") == "disabled" and not messagebox.askyesno("Specorde", "A task is still running. Quit anyway?\n\nFiles already moved can be put back with 'Restore folder'."):
         return
     if keep_save_job is not None:
@@ -3102,7 +5866,7 @@ left_title.grid(sticky="nw", pady=18, padx=18)
 organize_button = ctk.CTkButton(left, text="Organize", font=("Bahnschrift Light Condensed", 16), command=organize_open)
 organize_button.grid(sticky="nw", pady=(36, 18), padx=18)
 
-culler_button = ctk.CTkButton(left, text="Culler", font=("Bahnschrift Light Condensed", 16), command=pictures_open)
+culler_button = ctk.CTkButton(left, text="Pictures", font=("Bahnschrift Light Condensed", 16), command=pictures_open)
 culler_button.grid(sticky="nw", pady=18, padx=18)
 
 settings_button = ctk.CTkButton(left, text="Settings", font=("Bahnschrift Light Condensed", 16), command=settings_open)
@@ -3125,10 +5889,21 @@ header = ctk.CTkFrame(middle, height=124, fg_color="#1f2028", corner_radius=0)
 header.grid_rowconfigure(0, weight=1)
 header.grid_columnconfigure(1, weight=1)
 header.grid_columnconfigure(0, minsize=150)
-folder_browser = ctk.CTkButton(header, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18), width=124, height=29)
-folder_chosen = ctk.CTkLabel(header, text="Folder chosen:", text_color="grey", font=("Bahnschrift Light Condensed", 14), anchor="w")
+folder_strip = ctk.CTkFrame(header, width=600, height=72, fg_color="transparent")
+folder_browser = ctk.CTkButton(folder_strip, text="Choose a folder", command=pick_folder, font=("Bahnschrift Light Condensed", 18), width=124, height=29)
+folder_chosen = ctk.CTkLabel(folder_strip, text="Folder:", text_color="grey", font=("Bahnschrift Light Condensed", 14), anchor="w", width=140)
+folder_browser.place(x=314, y=22)
+folder_chosen.place(x=444, y=22)
+
 
 scale_probe = ctk.CTkFrame(middle, width=1000, height=10)
+ed_view = Editor(middle)
+ed_back_button = ctk.CTkButton(header, command=editor_back, text="Back to photos", font=("Bahnschrift Light Condensed", 13), width=100, height=14)
+ed_name_label = ctk.CTkLabel(header, text="", text_color="grey", font=("Bahnschrift Light Condensed", 14))
+canvas.bind("<Control-z>", lambda e: ed_view.do_undo() if editing() else None)
+canvas.bind("<Control-y>", lambda e: ed_view.do_redo() if editing() else None)
+canvas.bind("<Control-s>", lambda e: ed_view.save() if editing() else None)
+canvas.bind("<Control-a>", lambda e: marq_all() if currently_open == 3 and pics_view == "grid" and at_singles() and not focus_in_text() else None)
 overview_frame = ctk.CTkFrame(middle, width=view_w + 16, height=view_h_base, fg_color="#20222e", corner_radius=0)
 overview_frame.grid_propagate(False)
 overview_frame.grid_rowconfigure(0, weight=1)
@@ -3141,7 +5916,8 @@ pic_canvas.bind("<MouseWheel>", pic_wheel)
 pic_canvas.bind("<Configure>", lambda event: schedule_refresh())
 pic_canvas.bind("<ButtonPress-1>", pic_press)
 pic_canvas.bind("<ButtonRelease-1>", pic_release)
-pic_canvas.bind("<Button-3>", group_close)
+pic_canvas.bind("<B1-Motion>", pic_drag)
+pic_canvas.bind("<Button-3>", pic_context)
 pic_canvas.bind("<Motion>", pic_hover)
 pic_canvas.bind("<Leave>", lambda event: hover_clear())
 pic_canvas.grid(row=0, column=0, sticky="nsew")
@@ -3149,26 +5925,49 @@ pic_scroll.grid(row=0, column=1, sticky="ns")
 no_folder_label = ctk.CTkLabel(middle, text="No folder chosen yet.", font=("Bahnschrift Light Condensed", 28))
 culler_loading = ctk.CTkLabel(middle, text="Reading photos...", font=("Bahnschrift Light Condensed", 28))
 culler_empty = ctk.CTkLabel(middle, text="", text_color="grey", font=("Bahnschrift Light Condensed", 20), justify="center", wraplength=480)
-cutesy_bar = ctk.CTkFrame(middle, height = 8, fg_color="#20222e", width=652)
-culler_label = ctk.CTkLabel(header, text="Culler", font=("Bahnschrift Light Condensed", 32))
-culler_size_label = ctk.CTkLabel(header, text="Density: ", font=("Bahnschrift Light Condensed", 13))
-culler_size_changer = ctk.CTkButton(header, command=pictures_size, text="Medium", font=("Bahnschrift Light Condensed", 13), width=77, height=14)
+cutesy_bar = ctk.CTkFrame(middle, height=34, width=652, fg_color="#1b1d27", corner_radius=0)
+cutesy_bar.grid_propagate(False)
+cutesy_bar.grid_columnconfigure(0, weight=1)
+cutesy_bar.grid_rowconfigure(0, weight=1)
+culler_label = ctk.CTkLabel(header, text="Pictures", font=("Bahnschrift Light Condensed", 32))
+culler_mode_switch = ctk.CTkSegmentedButton(header, values=["Groups", "All photos"], command=pics_mode_set, font=(UI_FONT, 13), height=22, width=150, border_width=0, fg_color="#1f2028", unselected_color="#2c3043", unselected_hover_color="#3a4060", corner_radius=0)
+culler_mode_switch.set("All photos")
+def tool_button(master, text, command, width, **extra):
+    return ctk.CTkButton(master, text=text, command=command, font=(UI_FONT, 13), width=width, height=22, **extra)
+bar_info = ctk.CTkLabel(cutesy_bar, text="", text_color="#9aa0b0", font=(UI_FONT, 14), anchor="w")
+bar_info.grid(row=0, column=0, sticky="w", padx=(12, 6))
+bar_keep_button = tool_button(cutesy_bar, "Keep", lambda: marq_keep(True), 50, fg_color="#2e8b57", hover_color="#37a367")
+bar_unkeep_button = tool_button(cutesy_bar, "Unkeep", lambda: marq_keep(False), 60)
+bar_clear_button = tool_button(cutesy_bar, "✕", marq_clear, 28, fg_color="#2c3043", hover_color="#3a4060")
+bar_edit_button = tool_button(cutesy_bar, "Edit", edit_current, 48)
+bar_bulk_button = tool_button(cutesy_bar, "Bulk edit (0)", lambda: bulk_open(bulk_files()), 112)
+bar_wrap_button = tool_button(cutesy_bar, "Wrap up...", finish_open, 80)
+bar_edit_button.grid(row=0, column=4, padx=(0, 6), pady=5)
+bar_bulk_button.grid(row=0, column=5, padx=(0, 6), pady=5)
+bar_wrap_button.grid(row=0, column=6, padx=(0, 10), pady=5)
 culler_tools = ctk.CTkFrame(header, fg_color="transparent")
-culler_groups_button = ctk.CTkButton(culler_tools, command=groups_cycle, text="Groups: Normal", font=("Bahnschrift Light Condensed", 13), width=100, height=14)
-culler_time_button = ctk.CTkButton(culler_tools, command=time_toggle, text="EXIF dates only", font=("Bahnschrift Light Condensed", 13), width=150, height=14)
-culler_groups_button.grid(row=0, column=0, padx=(0,8))
-culler_time_button.grid(row=0, column=1)
-culler_back_button = ctk.CTkButton(header, command=group_close, text="Back to groups", font=("Bahnschrift Light Condensed", 13), width=100, height=14)
+culler_camera_menu = ctk.CTkOptionMenu(culler_tools, values=["Camera"], command=camera_changed, font=(UI_FONT, 13), width=118, height=22, dynamic_resizing=False)
+culler_groups_button = tool_button(culler_tools, "Groups: Normal", groups_cycle, 106)
+culler_time_button = tool_button(culler_tools, "Dates: EXIF", time_toggle, 94)
+culler_size_changer = tool_button(culler_tools, "Density: Medium", pictures_size, 110)
+culler_sort_button = tool_button(culler_tools, "Sort: Name", sort_cycle, 92)
+culler_finish_button = tool_button(culler_tools, "Wrap up...", finish_open, 82)
+culler_groups_button.grid(row=0, column=1, padx=(0, 6))
+culler_time_button.grid(row=0, column=2, padx=(0, 6))
+culler_size_changer.grid(row=0, column=3, padx=(0, 6))
+culler_finish_button.grid(row=0, column=4)
 culler_group_tools = ctk.CTkFrame(header, fg_color="transparent")
-culler_info_label = ctk.CTkLabel(culler_group_tools, text="", text_color="grey", font=("Bahnschrift Light Condensed", 14))
-culler_compare_button = ctk.CTkButton(culler_group_tools, command=compare_open, text="Compare (0)", font=("Bahnschrift Light Condensed", 13), width=90, height=14, state="disabled", fg_color="#173348")
-culler_delete_button = ctk.CTkButton(culler_group_tools, command=delete_rest, text="Delete rest", font=("Bahnschrift Light Condensed", 13), width=90, height=14, state="disabled", fg_color="#173348")
-culler_info_label.grid(row=0, column=0, padx=(0,12))
-culler_compare_button.grid(row=0, column=1, padx=(0,8))
-culler_delete_button.grid(row=0, column=2)
-culler_clear_button = ctk.CTkButton(culler_group_tools, command=clear_kept, text="Clear kept", font=("Bahnschrift Light Condensed", 13), width=76, height=14, state="disabled", fg_color="#173348")
-culler_clear_button.grid(row=0, column=3, padx=(8, 0))
-culler_camera_menu = ctk.CTkOptionMenu(header, values=["Camera"], command=camera_changed, font=("Bahnschrift Light Condensed", 13), width=126, height=22, dynamic_resizing=False)
+culler_back_button = tool_button(culler_group_tools, "Back to groups", group_close, 98)
+culler_info_label = ctk.CTkLabel(culler_group_tools, text="", text_color="grey", font=(UI_FONT, 14))
+culler_suggest_button = tool_button(culler_group_tools, "No clear pick", key_suggest, 116, state="disabled", fg_color="#173348")
+culler_compare_button = tool_button(culler_group_tools, "Compare (0)", compare_open, 88, state="disabled", fg_color="#173348")
+culler_delete_button = tool_button(culler_group_tools, "Delete rest", delete_rest, 88, state="disabled", fg_color="#173348")
+culler_clear_button = tool_button(culler_group_tools, "Clear kept", clear_kept, 84, state="disabled", fg_color="#173348")
+culler_back_button.grid(row=0, column=0, padx=(0, 6))
+culler_suggest_button.grid(row=0, column=1, padx=(0, 6))
+culler_compare_button.grid(row=0, column=2, padx=(0, 6))
+culler_delete_button.grid(row=0, column=3, padx=(0, 6))
+culler_clear_button.grid(row=0, column=4, padx=(0, 6))
 
 #tutorial
 tutorial_label = ctk.CTkLabel(header, text="Tutorial", font=("Bahnschrift Light Condensed", 30))
@@ -3199,6 +5998,12 @@ tutorial_text = [
     ("h3", "The overview"),
     ("p", "Click a group to open it. Hold the mouse button on a group to peek at its top photo, and let go to close the peek. Right-click or press 'Back to groups' to return. The blue number is how many photos are in a group, the green tick how many you kept."),
     ("h3", "Inside a group"),
+    ("h3", "Groups and All photos"),
+    ("p", "The switch next to the title changes the view. 'Groups' stacks similar photos. 'All photos' shows every picture on its own, sorted by name, date or camera. Compare, Delete rest and the sharpness hints only exist inside groups."),
+    ("h3", "Selecting with a rectangle"),
+    ("p", "Inside a group or in All photos, press and drag to draw a rectangle. Everything it touches is selected (blue frame). Hold Ctrl to add to the selection, and Ctrl+A selects everything. Press and hold without moving to peek instead. The bar at the bottom offers Keep, Unkeep, Edit and Bulk edit for the selection. Esc or a click on empty space clears it."),
+    ("h3", "Bulk edit"),
+    ("p", "Bulk edit applies one look to many photos and saves copies in 'edited_specorde'. 'Match brightness' lifts dark photos and lowers bright ones to the same median level before the look is applied, so everything ends up consistent. 'Auto-centre' crops each photo square around the subject, which works best on a plain background. Find it in the bottom bar, the right-click menu and the editor."),
     ("p", "Click a photo, or the tick box in its corner, to keep it. Click again to un-keep it. Double-click a photo to open it in its own window; that window has a Keep button, and clicking the photo closes it. Hold the mouse button on a photo to peek at it larger."),
     ("h3", "Compare"),
     ("p", "Keep 2 to 4 photos, then press Compare. Side by side: scroll to zoom, drag to pan, double-click to jump to full size. All photos move together, so you can check sharpness or eyes in the same spot. Blink: click or Space flips between the photos in the same spot. Slider: move the mouse across to wipe between two shots. Highlights: coloured glow where shots differ. Photos are lined up first, so small camera shake is ignored. 'Keep this one' keeps that photo and un-keeps the other compared ones."),
@@ -3206,6 +6011,12 @@ tutorial_text = [
     ("p", "When a group has at least one kept and one not-kept photo, 'Delete rest' moves every photo you did not keep into a 'rejected_specorde' folder. Nothing is deleted for good, and 'Restore folder' in Organize puts the photos back. It is not available for the Ungrouped pile."),
     ("h3", "Clear kept"),
     ("p", "Un-keeps every photo in the open group, so you can start the group again."),
+    ("h3", "Keyboard"),
+    ("p", "In Compare: Q and E switch the view, A and D (or the arrows) step through photos, R or K keeps the shown photo."),
+    ("p", "In Organize: 1, 2, 3 tick the functions, Enter runs, P toggles Preview, R restores, O picks a folder. In Settings: 1 and 2 switch pages. D, S, T, N and B cycle the dropdowns, and P cycles the watermark position (+ and - change its size)."),
+    ("p", "Arrow keys move the yellow frame. Enter opens a group, or a photo in its own window. R or K keeps a photo. Space, Enter or Tab opens, and holding them peeks. Esc goes back. F marks a group finished. W A S D move like the arrows. B keeps the suggested sharpest photo. N finishes the group and jumps to the next unfinished one. C opens Compare."),
+    ("h3", "Sharpness suggestion and Done"),
+    ("p", "Inside a group, Specorde frames the sharpest photo in gold with a BEST star and marks clearly blurrier ones SOFT. The gold button in the top bar (or the B key) keeps the sharpest one for you. If all photos are equally sharp, or most are soft, it assumes that is on purpose and the button says 'No clear pick'. These are only hints: nothing is moved unless you press 'Delete rest'. Finished groups show a green FINISHED bar."),
     ("h3", "The buttons at the top"),
     ("p", "'Groups' sets how alike photos must be to share a group: Tight, Normal or Loose. The date button switches between EXIF dates (photos without one are hidden) and file dates. The camera menu shows one camera at a time. 'Density' changes the thumbnail size."),
     ("h2", "Settings"),
@@ -3545,4 +6356,8 @@ start_thumb_workers()
 start_scan_workers()
 thumb_poll()
 scan_poll()
+scale_watch()
 canvas.mainloop()
+
+
+#We need to do some debugging. in the choice for all photos orgroups, switch the 2 so all photos is first, add some padding for the text and make the corners rounded. Add watermarking with the user choosing where the watermark lands and the size, a request for the pic too. make a center function. im a vinyl record photographer so i need every single shot of a record centered. add some better controls for the  mouse dragging choosing and also, for the bulk edit, give an option for the editor too, not just presets. allow users to make custom presets and if the user initially chooses bulk edit instead of just classic edit, clicking on pictures blinks through them
