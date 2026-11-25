@@ -18,7 +18,7 @@ from PIL import Image, ImageTk, ImageOps, ImageChops, ImageFilter, ImageStat, Im
 import json
 import threading
 import logging
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 import queue
 from send2trash import send2trash
 import ctypes
@@ -122,6 +122,7 @@ def setting_get(key, default=None):
     return settings.get(key, default)
 
 def setting_set(key, value):
+    settings_load()
     settings[key] = value
     tmp = settings_file.with_suffix(".tmp")
     try:
@@ -177,7 +178,6 @@ def run_execute():
             return
     cfg = {
         "find": actions_find.get(),
-        "water": actions_water.get(),
         "sort": actions_sort.get(),
         "rename": actions_rename.get(),
         "sortby": settings_sort_sortby.get(),
@@ -598,12 +598,65 @@ COPY_RE = re.compile(r"(?: \(\d+\)| - (?:copy|kópia)(?: \(\d+\))?)$", re.IGNORE
 
 def is_copy(file):
     return bool(COPY_RE.search(file.stem))
+WM_CORNERS = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"]
+wm_cache = {"key": None, "img": None}
 
-def watermark():
+def wm_ready():
+    p = setting_get("watermark_path")
+    return bool(p) and Path(p).is_file()
+
+def watermark_pick():
+    chosen = filedialog.askopenfilename(title="Choose a watermark image", filetypes=[("Images", "*.png *.webp *.jpg *.jpeg"), ("All files", "*.*")])
+    if not chosen:
+        return False
+    setting_set("watermark_path", chosen)
+    return True
+
+def wm_stamp():
+    p = setting_get("watermark_path")
+    if not p:
+        return None
     try:
-        ()
-    except NameError:
-        q.put(("status", "You must pick a folder."))
+        key = (p, Path(p).stat().st_mtime_ns)
+    except OSError:
+        return None
+    if wm_cache["key"] != key:
+        try:
+            wm_cache["img"] = Image.open(p).convert("RGBA")
+        except Exception:
+            logging.exception("Could not open the watermark image.")
+            wm_cache["img"] = None
+        wm_cache["key"] = key
+    return wm_cache["img"]
+
+def watermark_apply(img, stamp, corner, percent):
+    img = img.convert("RGBA")
+    w, h = img.size
+    mw = max(1, round(w * percent / 100))
+    mh = max(1, round(stamp.height * mw / stamp.width))
+    small = stamp.resize((mw, mh), Image.LANCZOS)
+    m = round(min(w, h) * 0.02)
+    if corner == "Top Left":
+        pos = (m, m)
+    elif corner == "Top Right":
+        pos = (w - mw - m, m)
+    elif corner == "Bottom Left":
+        pos = (m, h - mh - m)
+    elif corner == "Bottom Right":
+        pos = (w - mw - m, h - mh - m)
+    else:
+        pos = ((w - mw) // 2, (h - mh) // 2)
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    layer.paste(small, (max(pos[0], 0), max(pos[1], 0)))
+    return Image.alpha_composite(img, layer)
+
+def ed_watermark(img, st):
+    if not st["wm_on"]:
+        return img
+    stamp = wm_stamp()
+    if stamp is None:
+        return img
+    return watermark_apply(img, stamp, st["wm_corner"], st["wm_size"]).convert("RGB")
 
 PROTECTED_NAMES = {"desktop.ini", "thumbs.db", ".ds_store", "ntuser.dat", "pagefile.sys", "hiberfil.sys", "swapfile.sys"}
 PROTECTED_SUFFIXES = {".sys", ".dll", ".drv", ".ini", ".exe", ".msi", ".lnk", ".bat", ".cmd", ".reg"}
@@ -2416,6 +2469,11 @@ marq_add = False
 marq_x0 = 0.0
 marq_y0 = 0.0
 marq_last = -1
+press_mods = 0
+sel_anchor = None
+auto_job = None
+auto_speed = 0.0
+marq_ptr = (0, 0)
 pics_mode = "all"
 all_sort = "Name"
 move_limit = 8
@@ -2735,15 +2793,56 @@ def marq_keep(value):
         group_buttons_update()
     bottom_bar_update()
 
+def click_select(idx, shift, ctrl):
+    global sel_anchor
+    if shift and sel_anchor is not None and sel_anchor < len(cards):
+        a, b = sorted((sel_anchor, idx))
+        if not ctrl:
+            marq_sel.clear()
+        marq_sel.update(c[0] for c in cards[a:b + 1])
+    else:
+        file = cards[idx][0]
+        if file in marq_sel:
+            marq_sel.discard(file)
+        else:
+            marq_sel.add(file)
+        sel_anchor = idx
+    marq_draw()
+    bottom_bar_update()
+
+def marq_update():
+    x = pic_canvas.canvasx(marq_ptr[0])
+    y = pic_canvas.canvasy(marq_ptr[1])
+    left, right = sorted((marq_x0, x))
+    top, bottom = sorted((marq_y0, y))
+    hit = {cards[i][0] for i in marq_hits(left, top, right, bottom)}
+    marq_sel.clear()
+    marq_sel.update(marq_base | hit)
+    rubber_draw(x, y)
+    marq_draw()
+
+def auto_scroll_tick():
+    global auto_job
+    auto_job = None
+    view_h = pic_canvas.winfo_height()
+    if not marq_on or not auto_speed or pic_total_h <= view_h:
+        return
+    new_top = max(0, min(pic_canvas.canvasy(0) + auto_speed, pic_total_h - view_h))
+    pic_canvas.yview_moveto(new_top / pic_total_h)
+    marq_update()
+    bottom_bar_update()
+    auto_job = pic_canvas.after(16, auto_scroll_tick)
+
 def pic_press(event):
-    global press_job, press_idx, press_x, press_y, press_on_tick, marq_on, marq_x0, marq_y0, marq_add
+    global press_job, press_idx, press_x, press_y, press_on_tick, marq_on, marq_x0, marq_y0, marq_add, press_mods
     canvas.focus_set()
     sel_hide()
     peek_close()
     marq_on = False
+    press_mods = event.state
     marq_x0 = pic_canvas.canvasx(event.x)
     marq_y0 = pic_canvas.canvasy(event.y)
-    marq_add = bool(event.state & 0x4)
+    marq_add = bool(event.state & 0x5)
     press_idx = card_at(event)
     press_x = event.x_root
     press_y = event.y_root
@@ -2752,7 +2851,7 @@ def pic_press(event):
         press_job = pic_canvas.after(hold_ms, peek_start)
 
 def pic_drag(event):
-    global press_job, press_idx, marq_on, marq_base, marq_last
+    global press_job, press_idx, marq_on, marq_base, marq_last, marq_ptr, auto_speed, auto_job
     if peek_window is not None:
         return
     if not marq_on:
@@ -2769,21 +2868,18 @@ def pic_drag(event):
         marq_base = set(marq_sel) if marq_add else set()
         hover_clear()
         click_cancel()
+    marq_ptr = (event.x, event.y)
     view_h = pic_canvas.winfo_height()
-    if pic_total_h > view_h:
-        step = -24 if event.y < 24 else 24 if event.y > view_h - 24 else 0
-        if step:
-            new_top = max(0, min(pic_canvas.canvasy(0) + step, pic_total_h - view_h))
-            pic_canvas.yview_moveto(new_top / pic_total_h)
-    x = pic_canvas.canvasx(event.x)
-    y = pic_canvas.canvasy(event.y)
-    left, right = sorted((marq_x0, x))
-    top, bottom = sorted((marq_y0, y))
-    hit = {cards[i][0] for i in marq_hits(left, top, right, bottom)}
-    marq_sel.clear()
-    marq_sel.update(marq_base | hit)
-    rubber_draw(x, y)
-    marq_draw()
+    edge = 40
+    if event.y < edge:
+        auto_speed = -min(60.0, (edge - event.y) * 0.5 + 4)
+    elif event.y > view_h - edge:
+        auto_speed = min(60.0, (event.y - (view_h - edge)) * 0.5 + 4)
+    else:
+        auto_speed = 0.0
+    if auto_speed and auto_job is None:
+        auto_job = pic_canvas.after(16, auto_scroll_tick)
+    marq_update()
     if len(marq_sel) != marq_last:
         marq_last = len(marq_sel)
         bottom_bar_update()
@@ -2817,6 +2913,9 @@ def pic_release(event):
         return
     if at_groups():
         group_open(idx)
+        return
+    if press_mods & 0x5:
+        click_select(idx, bool(press_mods & 0x1), bool(press_mods & 0x4))
         return
     if on_tick and tick_hit(event, idx):
         last_click_idx = None
@@ -3458,19 +3557,14 @@ def settings_open(option=0):
     middle.grid_rowconfigure(8, weight=1)
     header.grid(column=0, row=0, sticky="ew", pady=(0,16))
     settings_label.grid(sticky="nw", pady=(18,0), padx=18, column=0, row=0)
-    settings_file.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
-    settings_pic.grid(sticky="sw", pady=8, padx=(8,0), column=1, row=1)
+    settings_org_button.grid(sticky="sw", pady=8, padx=(16,8), column=0, row=1)
     folder_strip.grid(row=0, column=0, columnspan=3, sticky="nw")
-    if option == 1:
-        water_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
-        water_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
-    else:
-        find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
-        find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
-        sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
-        sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
-        rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
-        rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
+    find_explain.grid(row=2, column=0, padx=20, pady=(5,0), sticky="w")
+    find_settings.grid(row=3, column=0, padx=20, pady=(1,12), sticky="ew")
+    sort_explain.grid(row=4, column=0, padx=20, pady=(5,0), sticky="w")
+    sort_settings.grid(row=5, column=0, padx=20, pady=(1,12), sticky="ew")
+    rename_explain.grid(row=6, column=0, padx=20, pady=(5,0), sticky="w")
+    rename_settings.grid(row=7, column=0, padx=20, pady=(1,12), sticky="ew")
     currently_open = 1
 
 def settings_change(option=0):
@@ -4015,21 +4109,8 @@ def page_key(event):
             pick_folder()
         else:
             return
-    elif water_settings.winfo_ismapped():
-        if key == "1":
-            settings_change(0)
-        elif key == "p":
-            menu_cycle(settings_watermark_corner)
-        elif key in ("plus", "equal", "kp_add"):
-            plus()
-        elif key in ("minus", "kp_subtract"):
-            minus()
-        else:
-            return
     else:
-        if key == "2":
-            settings_change(1)
-        elif key == "d":
+        if key == "d":
             menu_cycle(settings_duplicate_delete)
         elif key == "s":
             menu_cycle(settings_sort_sortby)
@@ -4518,6 +4599,7 @@ ED_HUES = (("Red", (1.0, 0.25, 0.2)), ("Orange", (1.0, 0.6, 0.2)), ("Yellow", (1
 ED_LOOK = ("exposure", "brilliance", "highlights", "shadows", "contrast", "blackpoint", "fade", "saturation", "vibrancy", "warmth", "tint", "hue_amount", "sharpness", "definition", "noise", "vignette", "tilt", "tilt_pos")
 ED_DEFAULT = {"turns": 0, "flip_h": False, "flip_v": False, "angle": 0.0, "crop": None, "hue": 0}
 ED_DEFAULT.update({k: 0.0 for k in ED_LOOK})
+ED_DEFAULT.update({"wm_on": False, "wm_corner": "Bottom Right", "wm_size": 20.0, "auto": False})
 ED_GROUPS = (
     ("Light", (("exposure", "Exposure", -1.0, 1.0), ("brilliance", "Brilliance", -1.0, 1.0), ("highlights", "Highlights", -1.0, 1.0), ("shadows", "Shadows", -1.0, 1.0), ("contrast", "Contrast", -1.0, 1.0), ("blackpoint", "Black point", -1.0, 1.0), ("fade", "Fade", 0.0, 1.0))),
     ("Colour", (("saturation", "Saturation", -1.0, 1.0), ("vibrancy", "Vibrancy", -1.0, 1.0), ("warmth", "Warmth", -1.0, 1.0), ("tint", "Tint", -1.0, 1.0), ("hue_amount", "Colour wash", 0.0, 1.0))),
@@ -4578,6 +4660,226 @@ def ed_look_active(st):
 
 def ed_lum(a):
     return a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+def ed_box_blur(a, r):
+    k = 2 * r + 1
+    p = np.pad(a, r, mode="edge")
+    c = np.pad(p.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+
+# ---- batch-aware prep: sleeve finding, square crop window, colour matching ----
+ED_PREP_MARGIN = 1.10      # how much floor shows around the sleeve (1.10 = 5% each side)
+ED_PREP_WHITE = 0.92       # brightness the batch's highlights are lifted to (one shared lift)
+
+def ed_blob(mask):
+    # biggest solid region of a True/False picture, found on a coarse grid (fast); returns (box in pixels, how full the box is)
+    step = max(1, mask.shape[1] // 160)
+    cells = Image.fromarray((mask * 255).astype(np.uint8)).resize((max(1, mask.shape[1] // step), max(1, mask.shape[0] // step)), Image.BOX)
+    cells = cells.point([0] * 128 + [255] * 128)
+    cells = cells.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(7))
+    cells = cells.filter(ImageFilter.MinFilter(5)).filter(ImageFilter.MaxFilter(5))
+    grid = np.asarray(cells) > 127
+    h, w = grid.shape
+    seen = np.zeros_like(grid)
+    best = None
+    for sy in range(h):
+        for sx in range(w):
+            if grid[sy, sx] and not seen[sy, sx]:
+                todo = deque([(sy, sx)])
+                seen[sy, sx] = True
+                found = []
+                while todo:
+                    y, x = todo.popleft()
+                    found.append((y, x))
+                    for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                        if 0 <= ny < h and 0 <= nx < w and grid[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            todo.append((ny, nx))
+                if best is None or len(found) > len(best):
+                    best = found
+    if not best or len(best) < 20:
+        return None
+    ys = np.array([c[0] for c in best])
+    xs = np.array([c[1] for c in best])
+    box_w = xs.max() - xs.min() + 1
+    box_h = ys.max() - ys.min() + 1
+    return (xs.min() * step, ys.min() * step, min((xs.max() + 1) * step, mask.shape[1]), min((ys.max() + 1) * step, mask.shape[0])), len(best) / (box_w * box_h)
+
+def ed_saturation(a):
+    mx = a.max(axis=2)
+    return float((mx - a.min(axis=2)).mean() / max(float(mx.mean()), 0.02))
+
+def ed_sleeve_find(img):
+    small = img.convert("RGB")
+    small.thumbnail((640, 640))
+    a = np.asarray(small, np.float32)
+    h, w = a.shape[:2]
+    gray = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    spread = np.sqrt(np.maximum(ed_box_blur(gray * gray, 4) - ed_box_blur(gray, 4) ** 2, 0))
+    smooth = spread < 4.0
+    blurred = np.asarray(small.filter(ImageFilter.GaussianBlur(3)), np.float32)
+    edge = np.concatenate([blurred[:6].reshape(-1, 3), blurred[-6:].reshape(-1, 3), blurred[:, :6].reshape(-1, 3), blurred[:, -6:].reshape(-1, 3)])
+    dist = np.abs(blurred - np.median(edge, axis=0)).sum(axis=2)
+    cut = max(ed_otsu(dist.ravel()), 25.0)
+    colour = dist > cut
+    best = None
+    for mask in (colour, smooth, colour | smooth):
+        found = ed_blob(mask)
+        if found is None:
+            continue
+        (x0, y0, x1, y1), fill = found
+        bw, bh = x1 - x0, y1 - y0
+        area = bw * bh / (w * h)
+        # a sleeve can fill almost the whole frame; only tiny bits and "the whole picture" are junk
+        if area > 0.99 or area < 0.12:
+            continue
+        squareness = min(bw, bh) / max(bw, bh)
+        score = fill * 0.5 + squareness * 0.3 + min(area / 0.5, 1.0) * 0.2
+        if best is None or score > best[0]:
+            best = (score, (x0 / w, y0 / h, x1 / w, y1 / h))
+    return best[1] if best else None
+
+def ed_edge_step(a, side, x0, y0, x1, y1):
+    # 0..1: how sharp the picture changes across one side of the box (a real sleeve edge is sharp)
+    h, w = a.shape[:2]
+    band = max(3, int(0.02 * min(h, w)))
+    if side == "top":
+        if y0 - band < 0:
+            return 0.0
+        out, inn, axis = a[y0 - band:y0, x0:x1], a[y0:y0 + band, x0:x1], 0
+    elif side == "bottom":
+        if y1 + band > h:
+            return 0.0
+        out, inn, axis = a[y1:y1 + band, x0:x1], a[y1 - band:y1, x0:x1], 0
+    elif side == "left":
+        if x0 - band < 0:
+            return 0.0
+        out, inn, axis = a[y0:y1, x0 - band:x0], a[y0:y1, x0:x0 + band], 1
+    else:
+        if x1 + band > w:
+            return 0.0
+        out, inn, axis = a[y0:y1, x1:x1 + band], a[y0:y1, x1 - band:x1], 1
+    if out.size == 0 or inn.size == 0:
+        return 0.0
+    m_out, m_in = out.mean(axis=axis), inn.mean(axis=axis)
+    step = np.abs(m_out - m_in).sum(axis=-1) / (m_out.sum(axis=-1) + m_in.sum(axis=-1) + 0.1)
+    return float((step > 0.2).mean())
+
+def ed_square_window(img, box, margin=ED_PREP_MARGIN):
+    # square crop around the box, as (centre x, centre y, side) in fractions of the width / height / width
+    small = img.convert("RGB")
+    small.thumbnail((640, 640))
+    a = np.asarray(small, np.float32) / 255
+    h, w = a.shape[:2]
+    x0, y0, x1, y1 = round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)
+    bw, bh = x1 - x0, y1 - y0
+    side = min(max(bw, bh) * margin, w, h)
+    steps = {s: ed_edge_step(a, s, x0, y0, x1, y1) for s in ("top", "bottom", "left", "right")}
+    def place(lo, hi, limit, first, second):
+        # the sleeve is square, so the shorter way is where the detector most likely missed a bit:
+        # hold on to the side with the sharper edge and let the window grow from there
+        pad = side * (margin - 1) / 2
+        if hi - lo >= side - 1e-6:
+            start = (lo + hi) / 2 - side / 2
+        elif steps[first] > steps[second] + 0.15:
+            start = lo - pad
+        elif steps[second] > steps[first] + 0.15:
+            start = hi + pad - side
+        else:
+            start = (lo + hi) / 2 - side / 2
+        return min(max(start, 0), limit - side)
+    left = place(x0, x1, w, "left", "right")
+    top = place(y0, y1, h, "top", "bottom")
+    return ((left + side / 2) / w, (top + side / 2) / h, side / w)
+
+def ed_floor_colour(img, box):
+    small = img.convert("RGB")
+    small.thumbnail((320, 320))
+    a = np.asarray(small, np.float32) / 255
+    h, w = a.shape[:2]
+    keep = np.ones((h, w), bool)
+    pad = 0.03
+    x0, y0, x1, y1 = box
+    keep[max(int((y0 - pad) * h), 0):int((y1 + pad) * h) + 1, max(int((x0 - pad) * w), 0):int((x1 + pad) * w) + 1] = False
+    if keep.mean() < 0.08:
+        return None
+    return np.median(a[keep], axis=0)
+
+def ed_plan(files):
+    lw = np.array([0.299, 0.587, 0.114])
+    items = []
+    for file in files:
+        img = load_image(file, (640, 640))
+        box = ed_sleeve_find(img)
+        window = ed_square_window(img, box) if box else None
+        floor = ed_floor_colour(img, box) if box else None
+        a = np.asarray(img.convert("RGB"), np.float32) / 255
+        items.append({"file": file, "window": window, "floor": floor,
+                      "peak": max(float(np.percentile(a.max(axis=2), 99.5)), 0.05),
+                      "med": max(float(np.median(a @ lw)), 0.02), "sat": ed_saturation(a)})
+    seen = [i for i in items if i["floor"] is not None]
+    if len(seen) >= 3:
+        # a "floor" far darker or brighter than the rest is probably the sleeve itself, so it must not set the reference
+        mid = float(np.median([i["floor"] @ lw for i in seen]))
+        for i in seen:
+            if not 0.45 < float(i["floor"] @ lw) / max(mid, 0.01) < 2.2:
+                i["floor"] = None
+    floors = np.array([i["floor"] for i in items if i["floor"] is not None])
+    if len(floors) > 0:
+        ref = np.median(floors, axis=0)
+        ref_lum = float(ref @ lw)
+        ref_tint = ref / ref_lum
+        ref_sat = float((ref.max() - ref.min()) / max(ref.max(), 0.02))
+    ref_med = float(np.median([i["med"] for i in items]))
+    ref_gsat = float(np.median([i["sat"] for i in items]))
+    for i in items:
+        if i["floor"] is not None:
+            # the floor is the same in every shot, so it is the yardstick: same brightness, same colour, same saturation
+            lum = float(i["floor"] @ lw)
+            gain = min(max(ref_lum / lum, 0.6), 1.6) * (1 + (np.clip(ref_tint / (i["floor"] / lum), 0.85, 1.18) - 1) * 0.8)
+            moved = i["floor"] * gain
+            now = float((moved.max() - moved.min()) / max(moved.max(), 0.02))
+            sat = min(max(ref_sat / max(now, 0.02), 0.6), 1.25)
+        else:
+            # no floor in this shot: nudge it halfway towards the batch average of the whole picture
+            gain = np.full(3, min(max((ref_med / i["med"]) ** 0.5, 0.8), 1.25))
+            sat = min(max((ref_gsat / max(i["sat"], 0.02)) ** 0.5, 0.85, ), 1.15)
+        i["gain"], i["satf"] = gain, sat
+    # one shared lift for the whole batch so the photos stay consistent with each other
+    lift = min(max(ED_PREP_WHITE / float(np.median([i["peak"] * i["gain"].max() for i in items])), 0.9), 2.2)
+    plan = {}
+    for i in items:
+        gain = i["gain"] * lift
+        over = gain.max() * i["peak"] / 0.97
+        if over > 1:
+            gain = gain / over
+        plan[i["file"]] = {"window": i["window"], "gain": gain, "sat": i["satf"]}
+    return plan
+
+def ed_prep_colour(img, item):
+    out = img.convert("RGB")
+    table = []
+    for c in range(3):
+        table += [round(min(max(i / 255 * item["gain"][c], 0.0), 1.0) * 255) for i in range(256)]
+    out = out.point(table)
+    if abs(item["sat"] - 1) > 0.02:
+        out = ImageEnhance.Color(out).enhance(item["sat"])
+    return out
+
+def ed_prep_crop(img, item):
+    w, h = img.size
+    if item["window"] is None:
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+    else:
+        cx, cy, side_w = item["window"]
+        side = min(side_w * w, w, h)
+        left = min(max(cx * w - side / 2, 0), w - side)
+        top = min(max(cy * h - side / 2, 0), h - side)
+    return img.crop((round(left), round(top), round(left) + round(side), round(top) + round(side)))
+
+def ed_apply_plan(img, item):
+    return ed_prep_colour(ed_prep_crop(img.convert("RGB"), item), item)
 
 def ed_denoise(img, amount):
     r = max(0.5, amount * max(img.size) / 700)
@@ -4709,6 +5011,8 @@ def ed_render(img, st, crop=True, adjust=True):
             out = out.crop(box)
     if adjust:
         out = ed_adjust(out, st)
+        if crop:
+            out = ed_watermark(out, st)
     return out.copy() if out is img else out
 def ed_crop_move(box, kind):
     l, t, r, b = box
@@ -4784,16 +5088,29 @@ def ed_exif(file):
         return None
 
 def ed_small(img):
-    w, h = img.size
-    crop = img.crop((w // 8, h // 8, w - w // 8, h - h // 8))
-    crop.thumbnail((256, 256))
-    return crop
+    probe = img.convert("RGB")
+    probe.thumbnail((640, 640), Image.BILINEAR)
+    found = ed_find_subject(probe)
+    if found is not None:
+        cx, cy, side, bg = found
+        half = max(8, round(side / 2))
+        probe = probe.crop((max(round(cx) - half, 0), max(round(cy) - half, 0), min(round(cx) + half, probe.width), min(round(cy) + half, probe.height)))
+    else:
+        w, h = probe.size
+        probe = probe.crop((w // 8, h // 8, w - w // 8, h - h // 8))
+    probe.thumbnail((256, 256))
+    return probe
 
 def ed_stats_small(small):
     a = np.asarray(small, np.float32) / 255
     lum = ed_lum(a)
     lo, hi = np.percentile(lum, [5, 95])
-    return {"median": min(max(float(np.median(lum)), 0.03), 0.97), "spread": max(float(hi - lo), 0.05), "chroma": float((a.max(axis=2) - a.min(axis=2)).mean())}
+    return {
+        "median": min(max(float(np.median(lum)), 0.03), 0.97),
+        "spread": max(float(hi - lo), 0.05),
+        "chroma": float((a.max(axis=2) - a.min(axis=2)).mean()),
+        "rgb": [float(np.median(a[..., c])) for c in range(3)],
+    }
 
 def ed_stats(img):
     return ed_stats_small(ed_small(img))
@@ -4801,14 +5118,27 @@ def ed_stats(img):
 def ed_normalise(img, t):
     small = ed_small(img)
     cur = ed_stats_small(small)
-    g = min(max(math.log(t["median"]) / math.log(cur["median"]), 0.4), 2.5)
+    gains = []
+    for c in range(3):
+        want = t["rgb"][c] / t["median"]
+        have = max(cur["rgb"][c], 0.01) / cur["median"]
+        gains.append(min(max(want / have, 0.85), 1.18))
+    mean_gain = sum(gains) / 3
+    gains = [g / mean_gain for g in gains]
+    balance = []
+    for g in gains:
+        balance += [round(min(i * g, 255)) for i in range(256)]
+    img = img.point(balance)
+    small = small.point(balance)
+    cur = ed_stats_small(small)
+    g = min(max(math.log(t["median"]) / math.log(cur["median"]), 0.7), 1.5)
     gam = [(i / 255) ** g for i in range(256)]
     first = small.point([round(255 * v) for v in gam] * 3)
-    spread = min(max(t["spread"] / ed_stats_small(first)["spread"], 0.6), 1.6)
+    spread = min(max(t["spread"] / ed_stats_small(first)["spread"], 0.8), 1.25)
     mid = t["median"]
     lut = [round(min(max((gam[i] - mid) * spread + mid, 0.0), 1.0) * 255) for i in range(256)]
     chroma = ed_stats_small(small.point(lut * 3))["chroma"]
-    sat = min(max(t["chroma"] / max(chroma, 0.01), 0.6), 1.6)
+    sat = min(max(t["chroma"] / max(chroma, 0.01), 0.6), 1.3)
     out = img.point(lut * 3)
     if abs(sat - 1) > 0.02:
         out = ImageEnhance.Color(out).enhance(sat)
@@ -4831,22 +5161,91 @@ def ed_autobox(img):
     cy = min(max((t + b) / 2, half), h - half)
     return [(cx - half) / w, (cy - half) / h, (cx + half) / w, (cy + half) / h]
 
+def ed_otsu(values, bins=64):
+    hist, edges = np.histogram(values, bins=bins)
+    hist = hist.astype(np.float64)
+    mids = (edges[:-1] + edges[1:]) / 2
+    w0 = np.cumsum(hist)
+    w1 = hist.sum() - w0
+    m0 = np.cumsum(hist * mids)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = w0 * w1 * (m0 / w0 - (m0[-1] - m0) / w1) ** 2
+    return float(mids[int(np.argmax(np.nan_to_num(between)))])
+
+def ed_find_subject(img):
+    small = img.convert("RGB")
+    small.thumbnail((256, 256))
+    small = small.filter(ImageFilter.GaussianBlur(5))
+    a = np.asarray(small, np.float32)
+    h, w = a.shape[:2]
+    edge = np.concatenate([a[:6].reshape(-1, 3), a[-6:].reshape(-1, 3), a[:, :6].reshape(-1, 3), a[:, -6:].reshape(-1, 3)])
+    bg = np.median(edge, axis=0)
+    dist = np.abs(a - bg).sum(axis=2)
+    mask = dist > max(ed_otsu(dist.ravel()), 25.0)
+    cleaned = Image.fromarray((mask * 255).astype(np.uint8)).filter(ImageFilter.MedianFilter(9))
+    mask = np.asarray(cleaned) > 127
+    ys, xs = np.nonzero(mask)
+    area = len(xs) / (w * h)
+    if area < 0.03 or area > 0.85:
+        return None
+    l, r = np.percentile(xs, [1, 99])
+    t, b = np.percentile(ys, [1, 99])
+    s = img.width / w
+    return ((l + r + 1) / 2 * s, (t + b + 1) / 2 * s, max(r - l, b - t) * s, tuple(int(v) for v in bg))
+
+def ed_centre(img, margin=1.1):
+    found = ed_find_subject(img)
+    if found is None:
+        logging.warning("Centre: could not find the subject, left as is.")
+        return img
+    cx, cy, side, bg = found
+    half = max(8, round(side * margin / 2))
+    half = min(half, img.width // 2, img.height // 2)
+    x0 = min(max(round(cx) - half, 0), img.width - half * 2)
+    y0 = min(max(round(cy) - half, 0), img.height - half * 2)
+    return img.convert("RGB").crop((x0, y0, x0 + half * 2, y0 + half * 2))
+
 def ed_geometry(img, st, centre):
     out = ed_render(img, st, adjust=False)
     if centre:
-        box = ed_autobox(out)
-        if box:
-            w, h = out.size
-            out = out.crop((round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)))
+        out = ed_centre(out)
     return out
 
-def ed_export(file, st, target=None, centre=False):
+def ed_autofix(img, white=0.92, strength=0.8):
+    small = img.convert("RGB")
+    small.thumbnail((256, 256))
+    a = np.asarray(small, np.float32) / 255
+    hi = np.array([max(float(np.percentile(a[..., c], 99.5)), 0.05) for c in range(3)])
+    lo = np.array([float(np.percentile(a[..., c], 0.5)) for c in range(3)])
+    balance = np.clip(hi.mean() / hi, 0.8, 1.25)
+    balance = 1 + (balance - 1) * strength
+    top = float(ed_lum(np.array([[hi * balance]]))[0, 0])
+    gain = min(max(white / max(top, 0.1), 0.8), 3.0)
+    black = min(float(lo.mean()) * 0.8, 0.1)
+    table = []
+    for c in range(3):
+        for i in range(256):
+            value = (i / 255 * balance[c] - black) * gain
+            table.append(round(min(max(value, 0.0), 1.0) * 255))
+    return img.convert("RGB").point(table)
+
+def ed_export(file, st, target=None, centre=False, item=None):
     try:
         big = 1 << 14
-        img = ed_geometry(load_image(file, (big, big), need=big), st, centre)
-        if target is not None:
+        img = load_image(file, (big, big), need=big)
+        own_geometry = bool(st["crop"]) or st["turns"] % 4 != 0 or st["flip_h"] or st["flip_v"] or abs(st["angle"]) >= 0.01
+        if item is not None and not own_geometry:
+            img = ed_apply_plan(img, item)
+        else:
+            img = ed_geometry(img, st, centre)
+            if item is not None:
+                img = ed_prep_colour(img, item)
+        if item is None and st.get("auto"):
+            img = ed_autofix(img)
+        elif target is not None:
             img = ed_normalise(img, target)
         img = ed_adjust(img, st)
+        img = ed_watermark(img, st)
         folder = file.parent / ED_FOLDER
         folder.mkdir(exist_ok=True)
         ext = file.suffix.lower()
@@ -4909,6 +5308,10 @@ class Editor:
         self.stage = None
         self.stage_key = None
         self.swatches = []
+        self.batch = []
+        self.batch_idx = 0
+        self.cache = {}
+        self.click_at = None
         self.build(parent)
 
     def dirty(self):
@@ -4997,8 +5400,22 @@ class Editor:
                         self.swatches.append(button)
                 self.add_slider(body, row, key, text, lo, hi)
                 row += 2
+        heading("Watermark", row)
+        row += 1
+        self.wm_check = ctk.CTkCheckBox(body, text="Add watermark", command=self.wm_toggle, font=(UI_FONT, 14))
+        self.wm_check.grid(row=row, column=0, padx=6, pady=(6, 0), sticky="w")
+        row += 1
+        wm_row = ctk.CTkFrame(body, fg_color="transparent")
+        wm_row.grid(row=row, column=0, padx=2, pady=(6, 0), sticky="w")
+        row += 1
+        self.wm_corner_menu = ctk.CTkOptionMenu(wm_row, values=WM_CORNERS, command=lambda c: self.commit("wm_corner", c), font=font, width=110, height=24, dynamic_resizing=False)
+        self.wm_corner_menu.grid(row=0, column=0, padx=(0, 5))
+        make_button(wm_row, "Choose image", self.wm_choose, 100).grid(row=0, column=1)
+        self.add_slider(body, row, "wm_size", "Size (% of width)", 1.0, 60.0)
+        row += 2
         self.cv.bind("<ButtonPress-1>", self.cv_press)
         self.cv.bind("<B1-Motion>", self.cv_drag)
+        self.batch_button = ctk.CTkButton(actions, text="Apply look to all", command=lambda: bulk_open(self.batch), font=(UI_FONT, 15), width=236, height=30, fg_color="#1f6aa5")
         self.cv.bind("<ButtonRelease-1>", self.cv_release)
         self.cv.bind("<Motion>", self.cv_motion)
         self.sync()
@@ -5017,49 +5434,93 @@ class Editor:
         slider.bind("<ButtonRelease-1>", lambda e, k=key: self.slide_done(k))
         slider.bind("<Double-Button-1>", lambda e, k=key: self.slide_reset(k))
         self.sliders[key] = (slider, label, text, lo, reset)
+    def wm_toggle(self):
+        want = bool(self.wm_check.get())
+        if want and not wm_ready():
+            if not watermark_pick():
+                self.wm_check.deselect()
+                return
+        self.commit("wm_on", want)
 
+    def wm_choose(self):
+        if watermark_pick() and self.st["wm_on"]:
+            self.refresh()
     def reset_one(self, key):
         self.trial = None
         self.commit(key, ED_DEFAULT[key])
 
     def rescale(self):
         s = ui_scale()
+        self.cache.clear()
         self.cw, self.ch = round(610 * s), round(436 * s)
         self.bg = ed_background(self.cw, self.ch)
         self.cv.configure(width=self.cw, height=self.ch)
         self.stage_key = None
         self.refresh()
 
-    def open_file(self, file):
+    def load_preview(self, file):
+        side = int(max(self.cw, self.ch) * 1.5)
+        img = load_image(file, (side * 2, side * 2), need=side)
+        img.thumbnail((side, side), Image.BILINEAR)
+        small = img.copy()
+        s2 = round(max(self.cw, self.ch) * 1.05)
+        small.thumbnail((s2, s2), Image.BILINEAR)
+        return img, small
+
+    def cache_put(self, file, pair):
+        self.cache[file] = pair
+        while len(self.cache) > 12:
+            try:
+                self.cache.pop(next(iter(self.cache)))
+            except (StopIteration, KeyError, RuntimeError):
+                break
+
+    def prefetch(self, file):
+        if file in self.cache:
+            return
+
+        def work():
+            try:
+                self.cache_put(file, self.load_preview(file))
+            except Exception:
+                logging.exception("Could not prefetch %s.", file.name)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_file(self, file, keep_look=False):
         self.file = file
         self.token += 1
         token = self.token
-        self.st = ed_copy(ED_DEFAULT)
-        self.saved = ed_copy(self.st)
-        self.undo = []
-        self.redo = []
+        if not keep_look:
+            self.st = ed_copy(ED_DEFAULT)
+            self.saved = ed_copy(self.st)
+            self.undo = []
+            self.redo = []
+            self.preset_menu.set(ED_PRESET_HINT)
         self.trial = None
-        self.src = None
-        self.small = None
         self.stage_key = None
         self.crop_mode = False
         self.drag = None
         self.box = None
         self.crop_actions.grid_forget()
         self.crop_button.configure(state="normal")
-        self.preset_menu.set(ED_PRESET_HINT)
-        self.cv.delete("all")
         self.cv.configure(cursor="")
+        hit = self.cache.get(file)
+        if hit is not None:
+            self.src, self.small = hit
+            self.sync()
+            return
+        self.src = None
+        self.small = None
+        if not keep_look:
+            self.cv.delete("all")
         self.sync()
         self.info.configure(text="Loading...")
-        side = int(max(self.cw, self.ch) * 1.5)
         holder = {}
 
         def work():
             try:
-                img = load_image(file, (side * 2, side * 2), need=side)
-                img.thumbnail((side, side), Image.BILINEAR)
-                holder["img"] = img
+                holder["img"] = self.load_preview(file)
             except Exception:
                 logging.exception("Could not open %s for editing.", file.name)
                 holder["img"] = False
@@ -5075,16 +5536,43 @@ class Editor:
                     messagebox.showwarning("Specorde", "Could not open this photo for editing.")
                     editor_back(True)
                     return
-                self.src = holder["img"]
-                self.small = self.src.copy()
-                side = round(max(self.cw, self.ch) * 1.05)
-                self.small.thumbnail((side, side), Image.BILINEAR)
+                self.src, self.small = holder["img"]
+                self.cache_put(file, holder["img"])
                 self.refresh()
             except Exception:
                 logging.exception("Editor loading check failed.")
 
         threading.Thread(target=work, daemon=True).start()
         self.frame.after(60, poll)
+
+    def batch_start(self, files):
+        self.batch = list(files)
+        self.batch_idx = 0
+        self.open_file(self.batch[0])
+        self.batch_update()
+        for k in (1, 2):
+            self.prefetch(self.batch[k % len(self.batch)])
+
+    def batch_step(self, delta):
+        if len(self.batch) < 2:
+            return
+        if self.crop_mode:
+            self.crop_end(True)
+        n = len(self.batch)
+        self.batch_idx = (self.batch_idx + delta) % n
+        self.open_file(self.batch[self.batch_idx], keep_look=True)
+        self.batch_update()
+        for k in (1, 2):
+            self.prefetch(self.batch[(self.batch_idx + k) % n])
+
+    def batch_update(self):
+        n = len(self.batch)
+        if n > 1:
+            self.batch_button.configure(text=f"Apply look to all {n} photos")
+            self.batch_button.grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky="w")
+            ed_name_label.configure(text=f"{trim(self.file.name, 40)}  ({self.batch_idx + 1}/{n})")
+        else:
+            self.batch_button.grid_forget()
 
     # ---- presets
     def preset_labels(self):
@@ -5158,6 +5646,11 @@ class Editor:
         self.redo.clear()
 
     def sync(self):
+        if self.st["wm_on"]:
+            self.wm_check.select()
+        else:
+            self.wm_check.deselect()
+        self.wm_corner_menu.set(self.st["wm_corner"])
         for key, (slider, label, text, lo, reset) in self.sliders.items():
             slider.set(self.st[key])
             self.value_label(key, self.st[key])
@@ -5173,6 +5666,8 @@ class Editor:
         slider, label, text, lo, reset = self.sliders[key]
         if key == "angle":
             shown = f"{value:+.1f}°"
+        elif key == "wm_size":
+            shown = f"{value:.0f}%"
         elif lo < 0:
             shown = f"{round(value * 100):+d}"
         else:
@@ -5287,6 +5782,8 @@ class Editor:
                 self.box_fit()
             self.draw_box()
             text = "Drag the corners, edges or the inside · Enter applies · Esc cancels"
+        elif len(self.batch) > 1:
+            text = f"Photo {self.batch_idx + 1}/{len(self.batch)} · click or Space: next · right-click: back · Ctrl+S saves this one"
         else:
             text = "C crop · Ctrl+Z undo · Ctrl+Y redo · Ctrl+S save · Esc back · double-click a slider to reset it"
         self.info.configure(text=text)
@@ -5392,6 +5889,7 @@ class Editor:
 
     def cv_press(self, e):
         canvas.focus_set()
+        self.click_at = (e.x, e.y)
         if not self.crop_mode or self.box is None:
             return
         dw, dh = self.disp[2], self.disp[3]
@@ -5402,6 +5900,12 @@ class Editor:
             x, y = min(max(x, 0), dw), min(max(y, 0), dh)
             box = [x, y, x, y]
         self.drag = {"kind": kind, "x": x, "y": y, "box": box}
+
+    def cv_release(self, e):
+        self.drag = None
+        start, self.click_at = self.click_at, None
+        if len(self.batch) > 1 and not self.crop_mode and start and math.hypot(e.x - start[0], e.y - start[1]) < 5:
+            self.batch_step(1)
 
     def cv_drag(self, e):
         d = self.drag
@@ -5425,9 +5929,6 @@ class Editor:
         self.box = [new[0] / dw, new[1] / dh, new[2] / dw, new[3] / dh]
         self.cv.delete("box")
         self.draw_box()
-
-    def cv_release(self, e):
-        self.drag = None
 
     # ---- save
     def save(self):
@@ -5487,10 +5988,28 @@ def editor_back(force=False):
         if not messagebox.askyesno("Specorde", "Go back without saving your changes?"):
             return
     ed_view.file = None
+    ed_view.batch = []
     ed_view.src = None
     ed_view.token += 1
     pics_view = "grid"
     pictures_open()
+
+def editor_open_batch(files):
+    global pics_view
+    files = [Path(f) for f in files if Path(f).suffix.lower() in pic_suffixes]
+    if not files:
+        messagebox.showinfo("Specorde", "No photos to edit.")
+        return
+    if ed_view.file is not None and ed_view.dirty():
+        if not messagebox.askyesno("Specorde", "Open these photos without saving your changes?"):
+            return
+    inspect_close_all()
+    compare_close()
+    peek_close()
+    ed_view.batch_start(files)
+    pics_view = "edit"
+    pictures_open()
+    canvas.focus_set()
 
 def editor_open(file):
     global pics_view
@@ -5504,6 +6023,8 @@ def editor_open(file):
     inspect_close_all()
     compare_close()
     peek_close()
+    ed_view.batch = []
+    ed_view.batch_update()
     if ed_view.file != file:
         ed_view.open_file(file)
     pics_view = "edit"
@@ -5560,6 +6081,10 @@ def editor_key(event):
             editor_back()
     elif key in ("f1", "question"):
         keys_open()
+    elif key in ("right", "space", "d") and ed_view.batch:
+        ed_view.batch_step(1)
+    elif key in ("left", "a") and ed_view.batch:
+        ed_view.batch_step(-1)
     else:
         return
     return "break"
@@ -5588,15 +6113,18 @@ def bulk_open(files=None):
     win.configure(fg_color="#1f2029")
     win.resizable(False, False)
     win.transient(canvas)
+    use_wm = tk.BooleanVar(master=win, value=bool(live and ed_view.st["wm_on"]))
     use_look = tk.BooleanVar(master=win, value=True)
-    use_match = tk.BooleanVar(master=win, value=True)
+    use_match = tk.BooleanVar(master=win, value=False)
     use_centre = tk.BooleanVar(master=win, value=False)
     use_geo = tk.BooleanVar(master=win, value=False)
-
+    use_auto = tk.BooleanVar(master=win, value=True)
+    use_prep = tk.BooleanVar(master=win, value=True)
     def go(chosen):
         if not chosen:
             return
         st = ed_copy(ED_DEFAULT)
+        st["auto"] = use_auto.get()
         look = live_look if live else bulk_look_get(look_menu.get())
         if use_look.get():
             st.update(look)
@@ -5606,6 +6134,19 @@ def bulk_open(files=None):
             st["crop"] = list(ed_view.st["crop"]) if ed_view.st["crop"] else None
         if use_centre.get():
             st["crop"] = None
+        if use_wm.get():
+            if not wm_ready() and not watermark_pick():
+                return
+            st["wm_on"] = True
+            if live:
+                st["wm_corner"] = ed_view.st["wm_corner"]
+                st["wm_size"] = ed_view.st["wm_size"]
+            else:
+                st["wm_corner"] = wm_corner.get()
+                try:
+                    st["wm_size"] = min(60.0, max(1.0, float(wm_size.get())))
+                except ValueError:
+                    st["wm_size"] = 20.0
         target = None
         if use_match.get():
             try:
@@ -5617,11 +6158,11 @@ def bulk_open(files=None):
                 target = ed_stats(ed_geometry(ref, st, use_centre.get()))
             except Exception:
                 logging.exception("Could not measure the reference photo.")
-        if st == ed_copy(ED_DEFAULT) and target is None and not use_centre.get():
+        if st == ed_copy(ED_DEFAULT) and target is None and not use_centre.get() and not use_prep.get():
             messagebox.showinfo("Specorde", "Tick at least one option.", parent=win)
             return
         win.destroy()
-        bulk_run(chosen, st, target, use_centre.get())
+        bulk_run(chosen, st, target, use_centre.get(), use_prep.get())
 
     def pick_files():
         picked = filedialog.askopenfilenames(parent=win, title="Choose photos", filetypes=[("Pictures", " ".join("*" + s for s in sorted(pic_suffixes))), ("All files", "*.*")])
@@ -5644,12 +6185,25 @@ def bulk_open(files=None):
     if not live:
         look_menu.grid(row=row, column=0, padx=20, pady=(0, 4))
         row += 1
-    options = [(match_text, use_match), ("Auto-centre on the subject (square crop)", use_centre)]
+    options = [("Auto-fix colour and brightness", use_auto), (match_text, use_match), ("Auto-centre on the subject (square crop)", use_centre)]
     if live:
         options.append(("Also apply this photo's crop and rotation", use_geo))
     for text, var in options:
         ctk.CTkCheckBox(win, text=text, variable=var, font=(UI_FONT, 14)).grid(row=row, column=0, sticky="w", padx=20, pady=3)
         row += 1
+    ctk.CTkCheckBox(win, text="Add watermarks to every photo", variable=use_wm, font=(UI_FONT, 14)).grid(row=row, column=0, sticky="w", padx=20, pady=3)
+    row += 1
+    if not live:
+        wm_row = ctk.CTkFrame(win, fg_color="transparent")
+        wm_row.grid(row=row, column=0, sticky="w", padx=20, pady=(0, 4))
+        row += 1
+        wm_corner = ctk.CTkOptionMenu(wm_row, values=WM_CORNERS, font=(UI_FONT, 13), width=150, height=24, dynamic_resizing=False)
+        wm_corner.set("Bottom Right")
+        wm_corner.grid(row=0, column=0, padx=(0, 8))
+        wm_size = ctk.CTkEntry(wm_row, width=50, justify="center")
+        wm_size.insert(0, "20")
+        wm_size.grid(row=0, column=1)
+        ctk.CTkLabel(wm_row, text="% of photo width", font=(UI_FONT, 13), text_color="grey").grid(row=0, column=2, padx=6)
     sources = []
     if files:
         sources.append((f"These {len(files)} photos", files))
@@ -5666,12 +6220,21 @@ def bulk_open(files=None):
         ctk.CTkButton(win, text=text, command=lambda c=chosen: go(c), state="normal" if chosen else "disabled", font=(UI_FONT, 14), width=340, height=28).grid(row=row, column=0, padx=20, pady=(8 if row == len(options) + 3 else 3, 3))
         row += 1
     ctk.CTkButton(win, text="Choose photos...", command=pick_files, font=(UI_FONT, 14), width=340, height=28).grid(row=row, column=0, padx=20, pady=3)
-    ctk.CTkButton(win, text="Cancel", command=win.destroy, font=(UI_FONT, 13), width=80, height=24, fg_color="#2c3043", hover_color="#3a4060").grid(row=row + 1, column=0, sticky="e", padx=20, pady=(8, 16))
-    center_on_main(win)
+    row += 1
+    if not live:
+        pool = files or (kept_now() if "target_folder" in globals() else [])
+
+        def to_editor():
+            win.destroy()
+            editor_open_batch(pool)
+
+        ctk.CTkButton(win, text=f"Design the look in the editor ({len(pool)} photos)...", command=to_editor, state="normal" if pool else "disabled", font=(UI_FONT, 14), width=340, height=28, fg_color="#1f6aa5").grid(row=row, column=0, padx=20, pady=(10, 3))
+        row += 1
+    ctk.CTkButton(win, text="Cancel", command=win.destroy, font=(UI_FONT, 13), width=80, height=24, fg_color="#2c3043", hover_color="#3a4060").grid(row=row, column=0, sticky="e", padx=20, pady=(8, 16))
     win.after(300, lambda: set_inspect_icon(win))
     win.after(60, lambda: reveal(win))
 
-def bulk_run(files, st, target, centre):
+def bulk_run(files, st, target, centre, prep=False):
     if execute_button.cget("state") == "disabled":
         messagebox.showinfo("Specorde", "Another task is still running. Try again when it has finished.")
         return
@@ -5679,9 +6242,9 @@ def bulk_run(files, st, target, centre):
     if not messagebox.askyesno("Specorde", f"Edit {n} photo{'' if n == 1 else 's'}?\n\nNew copies go to 'edited_specorde' next to each photo. Your originals stay untouched.\n\nContinue?"):
         return
     lock_ui()
-    start_execute(lambda: bulk_work(files, st, target, centre))
+    start_execute(lambda: bulk_work(files, st, target, centre, prep))
 
-def bulk_work(files, st, target, centre):
+def bulk_work(files, st, target, centre, prep=False):
     global pics_stamp
     q.put(("lock", None))
     q.put(("summary_clear", None))
@@ -5692,8 +6255,12 @@ def bulk_work(files, st, target, centre):
     try:
         bar_start()
         total = len(files)
+        plan = {}
+        if prep:
+            progress("Measuring photos...", 0, total)
+            plan = ed_plan(files)
         for number, file in enumerate(files, start=1):
-            if ed_export(file, st, target, centre).startswith("✓"):
+            if ed_export(file, st, target, centre, plan.get(file)).startswith("✓"):
                 saved += 1
             else:
                 failed += 1
@@ -5930,7 +6497,7 @@ cutesy_bar.grid_propagate(False)
 cutesy_bar.grid_columnconfigure(0, weight=1)
 cutesy_bar.grid_rowconfigure(0, weight=1)
 culler_label = ctk.CTkLabel(header, text="Pictures", font=("Bahnschrift Light Condensed", 32))
-culler_mode_switch = ctk.CTkSegmentedButton(header, values=["Groups", "All photos"], command=pics_mode_set, font=(UI_FONT, 13), height=22, width=150, border_width=0, fg_color="#1f2028", unselected_color="#2c3043", unselected_hover_color="#3a4060", corner_radius=0)
+culler_mode_switch = ctk.CTkSegmentedButton(header, values=["All photos", "Groups"], command=pics_mode_set, font=(UI_FONT, 15), height=30, width=210, border_width=4, corner_radius=12, fg_color="#2c3043", unselected_color="#2c3043", selected_color="#1f6aa5", unselected_hover_color="#3a4060")
 culler_mode_switch.set("All photos")
 def tool_button(master, text, command, width, **extra):
     return ctk.CTkButton(master, text=text, command=command, font=(UI_FONT, 13), width=width, height=22, **extra)
@@ -6003,7 +6570,7 @@ tutorial_text = [
     ("h3", "Selecting with a rectangle"),
     ("p", "Inside a group or in All photos, press and drag to draw a rectangle. Everything it touches is selected (blue frame). Hold Ctrl to add to the selection, and Ctrl+A selects everything. Press and hold without moving to peek instead. The bar at the bottom offers Keep, Unkeep, Edit and Bulk edit for the selection. Esc or a click on empty space clears it."),
     ("h3", "Bulk edit"),
-    ("p", "Bulk edit applies one look to many photos and saves copies in 'edited_specorde'. 'Match brightness' lifts dark photos and lowers bright ones to the same median level before the look is applied, so everything ends up consistent. 'Auto-centre' crops each photo square around the subject, which works best on a plain background. Find it in the bottom bar, the right-click menu and the editor."),
+    ("p", "Bulk edit applies one look to many photos and saves copies in 'edited_specorde'. Before editing it measures all the photos together: every photo is cropped square around the sleeve, and brightness, colour balance and saturation are pulled towards the average of the batch, using the floor as the reference, so one photo can no longer stand out. 'Match brightness' lifts dark photos and lowers bright ones to the same median level before the look is applied, so everything ends up consistent. 'Auto-centre' crops each photo square around the subject, which works best on a plain background. Find it in the bottom bar, the right-click menu and the editor."),
     ("p", "Click a photo, or the tick box in its corner, to keep it. Click again to un-keep it. Double-click a photo to open it in its own window; that window has a Keep button, and clicking the photo closes it. Hold the mouse button on a photo to peek at it larger."),
     ("h3", "Compare"),
     ("p", "Keep 2 to 4 photos, then press Compare. Side by side: scroll to zoom, drag to pan, double-click to jump to full size. All photos move together, so you can check sharpness or eyes in the same spot. Blink: click or Space flips between the photos in the same spot. Slider: move the mouse across to wipe between two shots. Highlights: coloured glow where shots differ. Photos are lined up first, so small camera shake is ignored. 'Keep this one' keeps that photo and un-keeps the other compared ones."),
@@ -6038,10 +6605,6 @@ sort_settings = ctk.CTkFrame(middle, width=364, height=88, fg_color="#1f2029")
 sort_settings.grid_rowconfigure(2, weight=1)
 sort_settings.grid_propagate(False)
 sort_settings.grid_columnconfigure(1, weight=1)
-water_settings = ctk.CTkFrame(middle, width=364, height=64, fg_color="#1f2029")
-water_settings.grid_rowconfigure(3, weight=1)
-water_settings.grid_propagate(False)
-water_settings.grid_columnconfigure(1, weight=1)
 rename_settings = ctk.CTkFrame(middle, width=364, height=44, fg_color="#1f2029")
 rename_settings.grid_rowconfigure(1, weight=1)
 rename_settings.grid_propagate(False)
@@ -6051,12 +6614,8 @@ rename_settings.grid_columnconfigure(1, minsize=40)
 find_explain = ctk.CTkLabel(middle, text_color="grey", text="Finding duplicate files", font=("Bahnschrift Light Condensed", 13))
 sort_explain = ctk.CTkLabel(middle, text_color="grey", text="Sorting files", font=("Bahnschrift Light Condensed", 13))
 rename_explain = ctk.CTkLabel(middle, text_color="grey", text="Renaming files", font=("Bahnschrift Light Condensed", 13))
-water_explain = ctk.CTkLabel(middle, text_color="grey", text="Adding watermarks", font=("Bahnschrift Light Condensed", 13))
-
 #Settings choice
-settings_file = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
-settings_pic = ctk.CTkButton(header, command=lambda: settings_change(1), text="Picture Modifier Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
-
+settings_org_button = ctk.CTkButton(header, command=lambda: settings_change(0), text="Organizer Settings", font=("Bahnschrift Light Condensed", 13), width=112, height=14)
 #Find Settings
 settings_duplicate_delete_text = ctk.CTkLabel(find_settings, text="Duplicates are: ", font=("Bahnschrift Light Condensed", 16))
 settings_duplicate_delete = ctk.CTkOptionMenu(find_settings, values=["Moved to a folder", "Deleted"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
@@ -6157,78 +6716,6 @@ def show_display(event):
     check_display.deiconify()
 custom_check_icon.bind("<Motion>", show_display)
 custom_check_icon.bind("<Leave>", lambda event: check_display.withdraw())
-#Watermark Settings
-
-settings_watermark_image_text = ctk.CTkLabel(water_settings, text="Watermark image: ", font=("Bahnschrift Light Condensed", 16))
-settings_watermark_image = ctk.CTkButton(water_settings, width=212, text="Choose an image", font=("Bahnschrift Light Condensed", 16), command=filedialog.askopenfile)
-settings_watermark_corner_text = ctk.CTkLabel(water_settings, text="Watermark position: ", font=("Bahnschrift Light Condensed", 16))
-settings_watermark_corner = ctk.CTkOptionMenu(water_settings, values=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Centre"], font=("Bahnschrift Light Condensed", 16), width=212, anchor="center")
-settings_watermark_corner.set("Top Right")
-
-watermark_size_frame = ctk.CTkFrame(water_settings, fg_color="transparent")
-watermark_size_frame.grid_columnconfigure(1, weight=1)
-settings_watermark_size_text = ctk.CTkLabel(watermark_size_frame, text="Watermark size: ", font=("Bahnschrift Light Condensed", 16))
-watermark_size_frame.grid(row=2,column=0, sticky="ew", columnspan=2)
-last_good=20
-def size_check(event=None):
-    global last_good
-    try:
-        if int(settings_watermark_size.get()) < 1 or int(settings_watermark_size.get()) > 150:
-            settings_watermark_size.delete(0, "end")
-            settings_watermark_size.insert(0, last_good)
-
-        else:
-            last_good = settings_watermark_size.get()
-    except ValueError:
-        settings_watermark_size.delete(0, "end")
-        settings_watermark_size.insert(0,last_good)
-
-watermark_size_subframe = ctk.CTkFrame(watermark_size_frame, fg_color="transparent")
-watermark_size_subframe.grid_columnconfigure(2, weight=1)
-watermark_size_subframe.grid(column = 1, row=0, sticky="e")
-
-settings_watermark_size = ctk.CTkEntry(watermark_size_subframe, justify="center", width=104)
-settings_watermark_size.bind("<FocusOut>", size_check)
-settings_watermark_size.insert(0, "20")
-settings_watermark_image_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-settings_watermark_image.grid(row=0, column=1, padx=16, pady=8, sticky="e")
-settings_watermark_corner_text.grid(padx=16, pady=8, row=1, column=0, sticky="w")
-settings_watermark_corner.grid(row=1, column=1, padx=16, pady=8, sticky="e")
-settings_watermark_size_text.grid(padx=16, pady=8, row=0, column=0, sticky="w")
-
-def minus():
-    global last_good
-    try:
-        updated = int(settings_watermark_size.get()) - 1
-        if updated < 1:
-            return
-        else:
-            last_good=updated
-        settings_watermark_size.delete(0, "end")
-        settings_watermark_size.insert(0, str(last_good))
-    except ValueError:
-        settings_watermark_size.delete(0, "end")
-        settings_watermark_size.insert(0, str(last_good))
-def plus():
-    global last_good
-    try:
-        updated = int(settings_watermark_size.get()) + 1
-        if updated > 150:
-            return   
-        else:
-            last_good=updated
-        settings_watermark_size.delete(0, "end")
-        settings_watermark_size.insert(0, str(updated))
-    except ValueError:
-        settings_watermark_size.delete(0, "end")
-        settings_watermark_size.insert(0, str(last_good))
-
-
-set_wat_minus = ctk.CTkButton(watermark_size_subframe, text="-", command=minus, font=("Bahnschrift Light Condensed", 16), width=49)
-set_wat_plus = ctk.CTkButton(watermark_size_subframe, text="+", command=plus, font=("Bahnschrift Light Condensed", 16), width=49)
-set_wat_minus.grid(row=0,column=0, padx=(65,0), sticky="w")
-settings_watermark_size.grid(row=0, column=1, padx=5, pady=8, sticky="w")
-set_wat_plus.grid(row=0,column=2, padx=(0,16), sticky="w")
 
 def dry_run_toggle():
     global dry_run
@@ -6358,6 +6845,3 @@ thumb_poll()
 scan_poll()
 scale_watch()
 canvas.mainloop()
-
-
-#We need to do some debugging. in the choice for all photos orgroups, switch the 2 so all photos is first, add some padding for the text and make the corners rounded. Add watermarking with the user choosing where the watermark lands and the size, a request for the pic too. make a center function. im a vinyl record photographer so i need every single shot of a record centered. add some better controls for the  mouse dragging choosing and also, for the bulk edit, give an option for the editor too, not just presets. allow users to make custom presets and if the user initially chooses bulk edit instead of just classic edit, clicking on pictures blinks through them
